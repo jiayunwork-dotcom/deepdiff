@@ -812,6 +812,12 @@ class FlatDataAction(EnumBase):
     unordered_iterable_item_added = 'unordered_iterable_item_added'
     unordered_iterable_item_removed = 'unordered_iterable_item_removed'
     initiated = "initiated"
+    # iterable_keys (stable identity) actions
+    identity_list_added = 'identity_list_added'
+    identity_list_removed = 'identity_list_removed'
+    identity_list_sequence = 'identity_list_sequence'
+    identity_change = 'identity_change'
+    identity_metadata = 'identity_metadata'
 
 
 OPCODE_TAG_TO_FLAT_DATA_ACTION = {
@@ -839,6 +845,9 @@ class FlatDeltaRow(NamedTuple):
     t1_to_index: Optional[int] = None
     t2_from_index: Optional[int] = None
     t2_to_index: Optional[int] = None
+    # Stable identity (JSON-safe list of [type, value] pairs) used by the
+    # iterable_keys actions. ``None`` means the row is not identity aware.
+    identity: Optional[Any] = None
 
     __repr__ = __str__ = named_tuple_repr
 

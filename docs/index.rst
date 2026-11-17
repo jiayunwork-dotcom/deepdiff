@@ -162,6 +162,7 @@ References
    :maxdepth: 4
 
    diff
+   iterable_keys
    dsearch
    deephash
    delta

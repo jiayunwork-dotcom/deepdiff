@@ -37,12 +37,17 @@ from deepdiff.model import (
     DictRelationship, AttributeRelationship, REPORT_KEYS,
     SubscriptableIterableRelationship, NonSubscriptableIterableRelationship,
     SetRelationship, NumpyArrayRelationship, CUSTOM_FIELD,
-    FORCE_DEFAULT,
+    FORCE_DEFAULT, IdentityRelationship,
 )
 from deepdiff.deephash import DeepHash, combine_hashes_lists
 from deepdiff.base import Base
 from deepdiff.lfucache import LFUCache, DummyLFU
 from deepdiff.colored_view import ColoredView
+from deepdiff.identity import (
+    IdentityRegistry, build_identity_index, identity_of,
+    validate_tree, ensure_record_list, ABSENT, WILDCARD,
+)
+from deepdiff.path import GET, GETATTR
 
 if TYPE_CHECKING:
     from pytz.tzinfo import BaseTzInfo
@@ -176,6 +181,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
                  include_obj_callback_strict: Optional[Callable]=None,
                  include_paths: Union[str, List[str], None]=None,
                  iterable_compare_func: Optional[Callable]=None,
+                 iterable_keys: Optional[Dict[str, Union[str, Tuple[str, ...], List[str]]]]=None,
                  log_frequency_in_sec: int=0,
                  log_scale_similarity_threshold: float=0.1,
                  log_stacktrace: bool=False,
@@ -259,6 +265,25 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
             self.include_obj_callback_strict = include_obj_callback_strict
             self.number_to_string = number_to_string_func or number_to_string
             self.iterable_compare_func = iterable_compare_func
+            self.iterable_keys = iterable_keys
+            self.identity_registry = IdentityRegistry(iterable_keys)
+            if self.identity_registry:
+                if ignore_order:
+                    raise ValueError(
+                        "iterable_keys can not be used together with ignore_order=True.")
+                if group_by is not None:
+                    raise ValueError(
+                        "iterable_keys can not be used together with group_by.")
+                if iterable_compare_func is not None:
+                    raise ValueError(
+                        "iterable_keys can not be used together with iterable_compare_func.")
+                validate_tree(t1, 't1', self.identity_registry)
+                validate_tree(t2, 't2', self.identity_registry)
+                self._validate_identity_declarations(t1, 't1')
+                self._validate_identity_declarations(t2, 't2')
+            elif iterable_keys is not None:
+                # An empty mapping is harmless but still stored.
+                pass
             self.zip_ordered_iterables = zip_ordered_iterables
             self.ignore_private_variables = ignore_private_variables
             self.ignore_nan_inequality = ignore_nan_inequality
@@ -780,10 +805,167 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
 
     def _diff_iterable(self, level: Any, parents_ids: FrozenSet[int]=frozenset(), _original_type: Optional[type]=None, local_tree: Optional[Any]=None) -> None:
         """Difference of iterables"""
+        if getattr(self, 'identity_registry', None):
+            key_spec = self.identity_registry.keys_for(self._element_chain(level))
+            if key_spec is not None:
+                self._diff_identity_iterable(level, parents_ids, key_spec, local_tree=local_tree)
+                return
         if (self.ignore_order_func and self.ignore_order_func(level)) or self.ignore_order:
             self._diff_iterable_with_deephash(level, parents_ids, _original_type=_original_type, local_tree=local_tree)
         else:
             self._diff_iterable_in_order(level, parents_ids, _original_type=_original_type, local_tree=local_tree)
+
+    @staticmethod
+    def _element_chain(level: Any) -> List[Tuple[Any, str]]:
+        """
+        Collect the (param, action) chain from the root to this level.
+
+        A level's incoming relationship lives on its parent
+        (``level.up.t1_child_rel``). Identity relationships address a record
+        by its identity rather than by an index; declarations use ``[*]`` for
+        that one element layer, so an identity segment is represented by the
+        wildcard ``'*'``.
+        """
+        chain = []
+        current = level
+        while current is not None and current.up is not None:
+            rel = current.up.t1_child_rel or current.up.t2_child_rel
+            if rel is None:
+                break
+            if isinstance(rel, IdentityRelationship):
+                chain.append((WILDCARD, GET))
+            else:
+                action = GETATTR if isinstance(rel, AttributeRelationship) else GET
+                chain.append((rel.param, action))
+            current = current.up
+        chain.reverse()
+        return chain
+
+    def _validate_identity_declarations(self, root: Any, side: str) -> None:
+        """
+        Walk every declared path (resolving ``[*]`` against the actual tree)
+        and make sure the target is a list of dicts with valid, unique keys.
+        Declarations whose path is absent on this side are allowed.
+        """
+        for list_path, key_spec in self.identity_registry.declarations.items():
+            from deepdiff.identity import _parse_declaration_path
+            parsed = _parse_declaration_path(list_path)
+            self._walk_declaration(root, parsed, 0, key_spec, list_path, side, [])
+
+    def _walk_declaration(self, obj: Any, parsed, position, key_spec, list_path: str,
+                          side: str, chain: List[Any]) -> None:
+        """
+        Resolve a declaration path against a concrete snapshot.
+
+        A ``[*]`` element matches one layer of elements inside its parent
+        list; the element *after* the wildcard (or the wildcard itself when it
+        is the final segment) must lead to the declared record list.
+        """
+        if position == len(parsed):
+            # Target reached: it must be a list and its records must carry
+            # valid, unique identities.
+            if obj is not None:
+                build_identity_index(obj, key_spec, list_path, side)
+            return
+        elem, is_wildcard = parsed[position]
+        last = position == len(parsed) - 1
+        if is_wildcard:
+            if not isinstance(obj, list):
+                # The parent of a [*] segment is not a list: the declaration
+                # does not match this branch.
+                return
+            if last:
+                # A trailing wildcard means the current list itself is the
+                # declared record list.
+                build_identity_index(obj, key_spec, list_path, side)
+                return
+            for item in obj:
+                self._walk_declaration(item, parsed, position + 1, key_spec,
+                                       list_path, side, chain)
+            return
+        if not isinstance(obj, dict) or elem not in obj:
+            # Path absent on this side: allowed.
+            return
+        child = obj[elem]
+        if last:
+            # The next element is the declared list itself.
+            if child is not None:
+                ensure_record_list(child, list_path, side)
+                build_identity_index(child, key_spec, list_path, side)
+            return
+        self._walk_declaration(child, parsed, position + 1, key_spec,
+                               list_path, side, chain + [elem])
+
+    def _diff_identity_iterable(self, level: Any, parents_ids: FrozenSet[int],
+                                key_spec: Tuple[str, ...], local_tree: Optional[Any]=None) -> None:
+        """
+        Compare two lists whose records are addressed by stable identities
+        instead of physical indexes.
+        """
+        t1 = level.t1
+        t2 = level.t2
+        # The level is the list container itself; its own path is a regular
+        # (physical) path. Stable paths only start at its record children.
+        list_path = level.path(force=FORCE_DEFAULT)
+        index1 = build_identity_index(t1, key_spec, list_path, 't1')
+        index2 = build_identity_index(t2, key_spec, list_path, 't2')
+        identities1 = set(index1.identity_to_index)
+        identities2 = set(index2.identity_to_index)
+
+        # Removed records (identity present in t1 only): report in t1 order.
+        for identity in sorted(identities1 - identities2, key=lambda ident: index1.identity_to_index[ident]):
+            if self._count_diff() is StopIteration:
+                return
+            i = index1.identity_to_index[identity]
+            change_level = self._identity_branch(level, identity, t1[i], notpresent, i, None)
+            self._report_result('iterable_identity_item_removed', change_level, local_tree=local_tree)
+
+        # Added records (identity present in t2 only): report in t2 order.
+        for identity in sorted(identities2 - identities1, key=lambda ident: index2.identity_to_index[ident]):
+            if self._count_diff() is StopIteration:
+                return
+            j = index2.identity_to_index[identity]
+            change_level = self._identity_branch(level, identity, notpresent, t2[j], None, j)
+            self._report_result('iterable_identity_item_added', change_level, local_tree=local_tree)
+
+        # Common records: recurse, and report a move when the physical index
+        # changed, independently of whether the content also changed.
+        for identity in sorted(identities1 & identities2, key=lambda ident: index1.identity_to_index[ident]):
+            if self._count_diff() is StopIteration:
+                return
+            i = index1.identity_to_index[identity]
+            j = index2.identity_to_index[identity]
+            x, y = t1[i], t2[j]
+            unchanged = (x == y and type(x) is type(y))
+            if i != j:
+                # A moved record that is otherwise unchanged needs no
+                # descendants, so a single branch level is sufficient and the
+                # expensive recursive machinery is skipped entirely.
+                move_level = self._identity_branch(level, identity, x, y, i, j)
+                self._report_result('iterable_identity_moved', move_level, local_tree=local_tree)
+                if unchanged:
+                    continue
+            if unchanged:
+                continue
+            # Content changed (possibly also moved): build a branch and recurse
+            # so nested field changes keep their stable identity path.
+            change_level = self._identity_branch(level, identity, x, y, i, j)
+            item_id = id(x)
+            if parents_ids and item_id in parents_ids:
+                continue
+            parents_ids_added = add_to_frozen_set(parents_ids, item_id)
+            self._diff(change_level, parents_ids_added, local_tree=local_tree)
+
+    def _identity_branch(self, level: Any, identity, t1_value, t2_value,
+                         physical1: Optional[int], physical2: Optional[int]) -> Any:
+        """
+        Branch one level deeper through an IdentityRelationship so every
+        descendant path carries the stable identity. Uses the lightweight
+        :meth:`DiffLevel.branch_identity` clone to keep branches independent
+        without the cost of a full generic chain rebuild on large lists.
+        """
+        return level.branch_identity(t1_value, t2_value, identity, physical1, physical2)
+
 
     def _compare_in_order(
         self, level,

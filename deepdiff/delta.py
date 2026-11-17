@@ -21,6 +21,11 @@ from deepdiff.path import (
 )
 from deepdiff.anyset import AnySet
 from deepdiff.summarize import summarize
+from deepdiff.identity_delta import IDENTITY_PATCH_KEY, reverse_identity_patch, IDENTITY_PATCH_VERSION
+from deepdiff.identity_engine import IdentityDeltaEngine, DeltaConflictError
+from deepdiff.identity import IdentityError
+# Re-exported as part of the public API (also re-exported from deepdiff/__init__.py).
+__all__ = ['Delta', 'DeltaError', 'DeltaNumpyOperatorOverrideError', 'DeltaConflictError']
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +158,16 @@ class Delta:
         self.raise_errors = raise_errors
         self.log_errors = log_errors
         self._numpy_paths = self.diff.get('_numpy_paths', False)
+        self._identity_patch = self.diff.get(IDENTITY_PATCH_KEY)
+        if self._identity_patch is not None:
+            self._validate_identity_patch()
+        # When an identity patch is present, bidirectional usage is mandatory
+        # so reverse application and conflict verification stay well defined.
+        if self._identity_patch is not None and not self.bidirectional:
+            raise ValueError(
+                "Deltas created with iterable_keys require bidirectional=True.")
+        # When an identity patch is present, bidirectional usage is mandatory
+        # so reverse application and conflict verification stay well defined.
         # When we create the delta from a list of flat dictionaries, details such as iterable_compare_func_was_used get lost.
         # That's why we allow iterable_compare_func_was_used to be explicitly set.
         self._iterable_compare_func_was_used = self.diff.get('_iterable_compare_func_was_used', iterable_compare_func_was_used)
@@ -172,9 +187,68 @@ class Delta:
     def reset(self):
         self.post_process_paths_to_convert = dict_()
 
+    def _validate_identity_patch(self):
+        """
+        Reject corrupt or unrecognized identity metadata explicitly instead
+        of silently degrading to an index based patch.
+        """
+        patch = self._identity_patch
+        if not isinstance(patch, dict):
+            raise DeltaError("Corrupt identity patch: expected a dictionary.")
+        version = patch.get('version')
+        if version != IDENTITY_PATCH_VERSION:
+            raise DeltaError(
+                f"Unrecognized identity patch version {version!r}; expected "
+                f"{IDENTITY_PATCH_VERSION}. Refusing to apply it as an index based delta.")
+        for required in ('declarations', 'lists', 'changes'):
+            if required not in patch:
+                raise DeltaError(f"Corrupt identity patch: missing {required!r}.")
+        if not isinstance(patch['lists'], dict) or not isinstance(patch['changes'], list):
+            raise DeltaError("Corrupt identity patch: malformed lists or changes.")
+        try:
+            from deepdiff.identity import registry_from_json, identity_from_json
+            registry_from_json(patch['declarations'])
+            for descriptor in patch['lists'].values():
+                for bucket in ('added', 'removed'):
+                    for entry in descriptor.get(bucket, []):
+                        identity_from_json(entry['identity'])
+                for bucket in ('before_identity', 'after_identity'):
+                    sequence = descriptor.get(bucket)
+                    if sequence is not None:
+                        for payload in sequence:
+                            identity_from_json(payload)
+        except IdentityError as exc:
+            raise DeltaError(f"Corrupt identity patch metadata: {exc}") from None
+
+    def apply_rebased(self, current, reverse=False):
+        """
+        Apply this delta onto ``current`` using identity based rebase.
+
+        The call never mutates ``current``: a deep copy is modified and a new
+        object is returned. Records are located by their stable identity,
+        independent of their physical index. Edits that still apply are
+        replayed, edits that already match are accepted and divergent edits
+        raise :class:`DeltaConflictError`. The delta remains usable afterwards.
+
+        Set ``reverse=True`` to apply the reverse direction (equivalent to
+        subtracting the delta), swapping the before/after roles.
+        """
+        if self._identity_patch is None:
+            raise DeltaError(
+                "apply_rebased is only available for deltas created with iterable_keys.")
+        if not self.bidirectional:
+            raise DeltaError("apply_rebased requires a bidirectional delta.")
+        patch = reverse_identity_patch(self._identity_patch) if reverse else self._identity_patch
+        engine = IdentityDeltaEngine(patch, reverse=reverse, rebased=True)
+        return engine.apply(current)
+
+
     def __add__(self, other):
         if isinstance(other, numbers) and self._numpy_paths:  # type: ignore
             raise DeltaNumpyOperatorOverrideError(DELTA_NUMPY_OPERATOR_OVERRIDE_MSG)
+        if self._identity_patch is not None:
+            engine = IdentityDeltaEngine(self._identity_patch, reverse=False, rebased=False)
+            return engine.apply(other)
         if self.mutate:
             self.root = other
         else:
@@ -205,6 +279,10 @@ class Delta:
     __radd__ = __add__
 
     def __rsub__(self, other):
+        if self._identity_patch is not None:
+            reversed_patch = reverse_identity_patch(self._identity_patch)
+            engine = IdentityDeltaEngine(reversed_patch, reverse=True, rebased=False)
+            return engine.apply(other)
         if self._reversed_diff is None:
             self._reversed_diff = self._get_reverse_diff()
         self.diff, self._reversed_diff = self._reversed_diff, self.diff
@@ -909,6 +987,120 @@ class Delta:
     def to_dict(self):
         return dict(self.diff)
 
+    def _flatten_identity_patch(self) -> List[FlatDeltaRow]:
+        """
+        Flatten the structured identity patch into machine readable rows.
+
+        The declarations and per-list descriptors are emitted explicitly so a
+        reconstructed delta keeps full stable-location information and never
+        silently degrades to index based behavior.
+        """
+        from deepdiff.helper import FlatDataAction
+        from deepdiff.identity import stable_path_to_flat_tokens
+        patch = self._identity_patch
+        rows: List[FlatDeltaRow] = []
+        # One metadata row carrying the declarations and format version.
+        rows.append(FlatDeltaRow(
+            path=['__identity__'],
+            action=FlatDataAction.identity_metadata,
+            value={'version': patch['version'], 'declarations': patch['declarations']},
+        ))
+        for list_path, descriptor in patch['lists'].items():
+            parsed_path = stable_path_to_flat_tokens(list_path)
+            for entry in descriptor.get('added', []):
+                rows.append(FlatDeltaRow(
+                    path=parsed_path.copy(),
+                    action=FlatDataAction.identity_list_added,
+                    value=entry['new_value'],
+                    identity=entry['identity'],
+                ))
+            for entry in descriptor.get('removed', []):
+                rows.append(FlatDeltaRow(
+                    path=parsed_path.copy(),
+                    action=FlatDataAction.identity_list_removed,
+                    old_value=entry['old_value'],
+                    identity=entry['identity'],
+                ))
+            rows.append(FlatDeltaRow(
+                path=parsed_path.copy(),
+                action=FlatDataAction.identity_list_sequence,
+                value=descriptor.get('after_identity'),
+                old_value=descriptor.get('before_identity'),
+            ))
+        for change in patch.get('changes', []):
+            rows.append(FlatDeltaRow(
+                path=stable_path_to_flat_tokens(change['path']),
+                action=FlatDataAction.identity_change,
+                value=change.get('new_value', UnkownValueCode),
+                old_value=change.get('old_value', UnkownValueCode),
+                identity=change['action'],
+            ))
+        return rows
+
+    @staticmethod
+    def _identity_patch_from_flat_rows(flat_dict_list):
+        """Reconstruct an identity patch from flat rows, validating it."""
+        from deepdiff.identity_delta import IDENTITY_PATCH_VERSION
+        metadata = None
+        lists: Dict[str, Any] = {}
+        changes = []
+        from deepdiff.identity import flat_tokens_to_stable_path
+        for flat in flat_dict_list:
+            action = flat.get('action')
+            if action is None:
+                continue
+            action_value = action.value if hasattr(action, 'value') else action
+            if action_value == 'identity_metadata':
+                metadata = flat.get('value')
+                continue
+            path = flat.get('path')
+            if not isinstance(path, list):
+                raise DeltaError("Corrupt identity flat rows: paths must be parsed lists.")
+            try:
+                path_str = flat_tokens_to_stable_path(path)
+            except IdentityError as exc:
+                raise DeltaError(f"Corrupt identity flat rows: {exc}") from None
+            if action_value == 'identity_list_added':
+                descriptor = lists.setdefault(path_str, {
+                    'added': [], 'removed': [],
+                    'before_identity': None, 'after_identity': None})
+                descriptor['added'].append(
+                    {'identity': flat['identity'], 'new_value': flat.get('value')})
+            elif action_value == 'identity_list_removed':
+                descriptor = lists.setdefault(path_str, {
+                    'added': [], 'removed': [],
+                    'before_identity': None, 'after_identity': None})
+                descriptor['removed'].append(
+                    {'identity': flat['identity'], 'old_value': flat.get('old_value')})
+            elif action_value == 'identity_list_sequence':
+                descriptor = lists.setdefault(path_str, {
+                    'added': [], 'removed': [],
+                    'before_identity': None, 'after_identity': None})
+                descriptor['after_identity'] = flat.get('value')
+                descriptor['before_identity'] = flat.get('old_value')
+            elif action_value == 'identity_change':
+                change_action = flat.get('identity') or 'values_changed'
+                entry = {'action': change_action, 'path': path_str}
+                if flat.get('value', UnkownValueCode) != UnkownValueCode:
+                    entry['new_value'] = flat['value']
+                if flat.get('old_value', UnkownValueCode) != UnkownValueCode:
+                    entry['old_value'] = flat['old_value']
+                changes.append(entry)
+        if metadata is None:
+            raise DeltaError(
+                "Corrupt identity flat rows: missing the identity metadata row; "
+                "refusing to silently degrade to an index based delta.")
+        if metadata.get('version') != IDENTITY_PATCH_VERSION:
+            raise DeltaError(
+                f"Unrecognized identity patch version {metadata.get('version')!r}; expected "
+                f"{IDENTITY_PATCH_VERSION}.")
+        return {
+            'version': metadata['version'],
+            'declarations': metadata['declarations'],
+            'lists': lists,
+            'changes': changes,
+        }
+
     def _flatten_iterable_opcodes(self, _parse_path):
         """
         Converts op_codes to FlatDeltaRows
@@ -962,6 +1154,25 @@ class Delta:
         Create the delta's diff object from the flat_dict_list
         """
         result = {}
+        # Materialize first: the input may be a one-shot generator (as produced
+        # by _from_flat_rows) and the identity scan below must not exhaust it
+        # before the regular reconstruction runs.
+        flat_dict_list = list(flat_dict_list)
+        # Identity aware rows carry their own structured patch and must not be
+        # mixed into the regular index based dictionaries.
+        identity_actions = {
+            'identity_metadata', 'identity_list_added', 'identity_list_removed',
+            'identity_list_sequence', 'identity_change',
+        }
+        has_identity_rows = any(
+            (row.get('action').value if hasattr(row.get('action'), 'value') else row.get('action'))
+            in identity_actions
+            for row in flat_dict_list
+        )
+        if has_identity_rows:
+            patch = Delta._identity_patch_from_flat_rows(flat_dict_list)
+            result[IDENTITY_PATCH_KEY] = patch
+            return result
         FLATTENING_NEW_ACTION_MAP = {
             'unordered_iterable_item_added': 'iterable_items_added_at_indexes',
             'unordered_iterable_item_removed': 'iterable_items_removed_at_indexes',
@@ -1132,6 +1343,8 @@ class Delta:
             _parse_path = partial(parse_path, include_actions=True)
         else:
             _parse_path = parse_path
+        if self._identity_patch is not None:
+            result.extend(self._flatten_identity_patch())
         if report_type_changes:
             keys_and_funcs = [
                 ('value', 'value', None),

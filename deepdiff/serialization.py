@@ -301,6 +301,10 @@ class SerializationMixin:
         if self.iterable_compare_func:  # type: ignore
             result['_iterable_compare_func_was_used'] = True
 
+        if getattr(self, 'identity_registry', None) and self.identity_registry:  # type: ignore
+            from deepdiff.identity_delta import build_identity_patch, IDENTITY_PATCH_KEY
+            result[IDENTITY_PATCH_KEY] = build_identity_patch(self)
+
         return deepcopy(dict(result))
 
     def pretty(self, prefix: Optional[Union[str, Callable]]=None):
@@ -444,6 +448,9 @@ def _get_pretty_form_text(verbose_level):
         "set_item_added": "Item root[{val_t2}] added to set.",
         "set_item_removed": "Item root[{val_t1}] removed from set.",
         "repetition_change": "Repetition change for item {diff_path}.",
+        "iterable_identity_item_added": "Record {diff_path} (identity {identity}) added to iterable.",
+        "iterable_identity_item_removed": "Record {diff_path} (identity {identity}) removed from iterable.",
+        "iterable_identity_moved": "Record {diff_path} (identity {identity}) moved from {path_t1} to {path_t2}.",
     }
     if verbose_level == 2:
         pretty_form_texts.update(
@@ -467,6 +474,19 @@ def pretty_print_diff(diff):
     val_t2 = '"{}"'.format(str(diff.t2)) if type_t2 == "str" else str(diff.t2)
 
     diff_path = diff.path(root='root')
+    if diff.report_type in {
+        'iterable_identity_item_added',
+        'iterable_identity_item_removed',
+        'iterable_identity_moved',
+    }:
+        from deepdiff.identity import render_identity
+        identity = render_identity(diff.identity) if diff.identity is not None else 'unknown'
+        return _get_pretty_form_text(diff.verbose_level).get(diff.report_type, "").format(
+            diff_path=diff.stable_path(),
+            identity=identity,
+            path_t1=diff.physical_path(use_t2=False),
+            path_t2=diff.physical_path(use_t2=True),
+        )
     return _get_pretty_form_text(diff.verbose_level).get(diff.report_type, "").format(
         diff_path=diff_path,
         type_t1=type_t1,

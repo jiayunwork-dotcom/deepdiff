@@ -152,6 +152,15 @@ iterable_compare_func:
     There are times that we want to guide DeepDiff as to what items to compare with other items. In such cases we can pass a iterable_compare_func that takes a function pointer to compare two items. The function takes three parameters (x, y, level) and should return True if it is a match, False if it is not a match or raise CannotCompare if it is unable to compare the two.
 
 
+iterable_keys: Dictionary, default = None
+    :ref:`iterable_keys_label`
+    Maps list paths to the key field name(s) that uniquely identify their
+    records so records are tracked by stable identity instead of physical
+    index. Mutually exclusive with ``ignore_order``, ``group_by`` and
+    ``iterable_compare_func``. See :ref:`iterable_keys_label` for the full
+    semantics, diff report keys, delta and rebase behavior.
+
+
 log_frequency_in_sec: Integer, default = 0
     :ref:`log_frequency_in_sec_label`
     How often to log the progress. The default of 0 means logging progress is disabled.

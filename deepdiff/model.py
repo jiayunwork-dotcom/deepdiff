@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Mapping
+from copy import copy as shallow_copy
 from copy import copy
 from typing import Any, Dict, List, Optional, Set, Union, Literal, Type, TYPE_CHECKING
 from deepdiff.helper import (
@@ -29,6 +30,10 @@ REPORT_KEYS: Set[str] = {
     "set_item_removed",
     "set_item_added",
     "repetition_change",
+    # iterable_keys (stable identity) report keys
+    "iterable_identity_item_added",
+    "iterable_identity_item_removed",
+    "iterable_identity_moved",
 }
 
 CUSTOM_FIELD: str = "__internal:custom:extra_info"
@@ -122,6 +127,9 @@ class TextResult(ResultDict):
             "iterable_item_added": dict_(),
             "iterable_item_removed": dict_(),
             "iterable_item_moved": dict_(),
+            "iterable_identity_item_added": dict_(),
+            "iterable_identity_item_removed": dict_(),
+            "iterable_identity_moved": dict_(),
             "attribute_added": self.__set_or_dict(),
             "attribute_removed": self.__set_or_dict(),
             "set_item_removed": SetOrdered(),
@@ -149,6 +157,7 @@ class TextResult(ResultDict):
         self._from_tree_default(tree, 'iterable_item_added')
         self._from_tree_default(tree, 'iterable_item_removed')
         self._from_tree_iterable_item_moved(tree)
+        self._from_tree_identity_results(tree)
         self._from_tree_default(tree, 'attribute_added')
         self._from_tree_default(tree, 'attribute_removed')
         self._from_tree_set_item_removed(tree)
@@ -193,7 +202,9 @@ class TextResult(ResultDict):
     def _from_tree_type_changes(self, tree):
         if 'type_changes' in tree:
             for change in tree['type_changes']:
-                path = change.path(force=FORCE_DEFAULT)
+                path = change.stable_path() if change.identity is not None else change.path(force=FORCE_DEFAULT)
+                if path is None:
+                    path = change.path(force=FORCE_DEFAULT)
                 if type(change.t1) is type:
                     include_values = False
                     old_type = change.t1
@@ -213,11 +224,17 @@ class TextResult(ResultDict):
                 self['type_changes'][path] = remap_dict
                 if self.verbose_level and include_values:
                     remap_dict.update(old_value=change.t1, new_value=change.t2)
+                if change.identity is not None:
+                    remap_dict['stable_path'] = change.stable_path()
+                    remap_dict['path_t1'] = change.physical_path(use_t2=False)
+                    remap_dict['path_t2'] = change.physical_path(use_t2=True)
 
     def _from_tree_value_changed(self, tree):
         if 'values_changed' in tree and self.verbose_level > 0:
             for change in tree['values_changed']:
-                path = change.path(force=FORCE_DEFAULT)
+                path = change.stable_path() if change.identity is not None else change.path(force=FORCE_DEFAULT)
+                if path is None:
+                    path = change.path(force=FORCE_DEFAULT)
                 the_changed = {'new_value': change.t2, 'old_value': change.t1}
                 if self.verbose_level > 1:
                     new_path = change.path(use_t2=True, force=FORCE_DEFAULT)
@@ -226,6 +243,10 @@ class TextResult(ResultDict):
                 self['values_changed'][path] = the_changed
                 if 'diff' in change.additional:
                     the_changed.update({'diff': change.additional['diff']})
+                if change.identity is not None:
+                    the_changed['stable_path'] = change.stable_path()
+                    the_changed['path_t1'] = change.physical_path(use_t2=False)
+                    the_changed['path_t2'] = change.physical_path(use_t2=True)
 
     def _from_tree_iterable_item_moved(self, tree):
         if 'iterable_item_moved' in tree and self.verbose_level > 1:
@@ -234,6 +255,38 @@ class TextResult(ResultDict):
                 the_changed = {'new_path': change.path(use_t2=True, reporting_move=True), 'value': change.t2}
                 self['iterable_item_moved'][change.path(
                     force=FORCE_DEFAULT, use_t2=False, reporting_move=True)] = the_changed
+
+    def _from_tree_identity_results(self, tree):
+        """Render the stable-identity report keys for the text view."""
+        for report_type, side in (
+            ('iterable_identity_item_added', 't2'),
+            ('iterable_identity_item_removed', 't1'),
+        ):
+            if report_type not in tree:
+                continue
+            for change in tree[report_type]:
+                stable = change.stable_path()
+                physical_t1 = change.physical_path(use_t2=False)
+                physical_t2 = change.physical_path(use_t2=True)
+                value = change.t2 if side == 't2' else change.t1
+                self[report_type][stable] = RemapDict({
+                    'value': value,
+                    'identity': change.identity,
+                    'path_t1': physical_t1,
+                    'path_t2': physical_t2,
+                })
+        if 'iterable_identity_moved' in tree:
+            # Moves are reported even at the default verbose level.
+            for change in tree['iterable_identity_moved']:
+                incoming_rel = change.up.t1_child_rel or change.up.t2_child_rel
+                self['iterable_identity_moved'][change.stable_path()] = RemapDict({
+                    'identity': change.identity,
+                    'path_t1': change.physical_path(use_t2=False),
+                    'path_t2': change.physical_path(use_t2=True),
+                    'index_t1': incoming_rel.physical_param,
+                    'index_t2': incoming_rel.physical_param2,
+                    'value': change.t2,
+                })
 
     def _from_tree_unprocessed(self, tree):
         if 'unprocessed' in tree:
@@ -313,6 +366,9 @@ class DeltaResult(TextResult):
             "iterable_item_added": dict_(),
             "iterable_item_removed": dict_(),
             "iterable_item_moved": dict_(),
+            "iterable_identity_item_added": dict_(),
+            "iterable_identity_item_removed": dict_(),
+            "iterable_identity_moved": dict_(),
             "attribute_added": dict_(),
             "attribute_removed": dict_(),
             "set_item_removed": dict_(),
@@ -324,6 +380,27 @@ class DeltaResult(TextResult):
 
         if tree_results:
             self._from_tree_results(tree_results)
+            # Identity report keys are consumed into the structured identity
+            # patch instead of the regular path based delta dictionaries.
+            for identity_key in (
+                'iterable_identity_item_added',
+                'iterable_identity_item_removed',
+                'iterable_identity_moved',
+            ):
+                self.pop(identity_key, None)
+            # Stable-path entries produced for identity records would not be
+            # replayable by the index based delta engine; the identity engine
+            # owns them. Drop any entry whose path uses identity segments.
+            from deepdiff.identity import IDENTITY_PATH_SEGMENT_RE
+            for report_key in (
+                'values_changed', 'type_changes',
+                'dictionary_item_added', 'dictionary_item_removed',
+                'attribute_added', 'attribute_removed',
+            ):
+                bucket = self.get(report_key)
+                if isinstance(bucket, dict):
+                    for path in [p for p in bucket if IDENTITY_PATH_SEGMENT_RE.search(p)]:
+                        del bucket[path]
 
     def _from_tree_results(self, tree):
         """
@@ -587,6 +664,9 @@ class DiffLevel:
         # Will cache result of .path() per 'force' as key for performance
         self._path = dict_()
 
+        # Cache for identity-aware stable/physical paths.
+        self._identity_paths = dict_()
+
         self.verbose_level = verbose_level
 
     def __repr__(self) -> str:
@@ -778,6 +858,104 @@ class DiffLevel:
             output = result
         return output
 
+    def _walk_identity_chain(self):
+        """
+        Walk from the root level down to this level, yielding the incoming
+        relationship (the one stored on the parent) that leads to each
+        descendant level.
+        """
+        levels = []
+        level = self
+        while level is not None and level.up is not None:
+            levels.append(level)
+            level = level.up
+        levels.reverse()
+        for child in levels:
+            rel = child.up.t1_child_rel or child.up.t2_child_rel
+            if rel is None:
+                break
+            yield child, rel
+
+    def stable_path(self, root: str = "root") -> Optional[str]:
+        """
+        Identity-aware path: dictionary fields are rendered as usual while
+        records of a declared identity list are addressed by their identity
+        (e.g. ``root['orders'][int=7]['lines'][str='a',int=1]``) instead of
+        their physical index. Returns ``None`` when a segment is not
+        representable as a string.
+        """
+        if 'stable' in self._identity_paths:
+            cached = self._identity_paths['stable']
+            return None if cached is None else self._format_result(root, cached)
+        from deepdiff.identity import format_identity_segment
+        result = ''
+        representable = True
+        for _, next_rel in self._walk_identity_chain():
+            if isinstance(next_rel, IdentityRelationship):
+                assert next_rel.param is not None
+                result += format_identity_segment(next_rel.param)
+            else:
+                item = next_rel.get_param_repr(None)
+                if item:
+                    result += item
+                else:
+                    representable = False
+                    break
+        if not representable:
+            self._identity_paths['stable'] = None
+            return None
+        self._identity_paths['stable'] = result
+        return self._format_result(root, result)
+
+    def physical_path(self, use_t2: bool = False, root: str = "root") -> Optional[str]:
+        """
+        Physical path of this level: identity list segments are rendered with
+        the record's physical index on the requested side instead of its
+        identity. The result is a regular, ``extract``-compatible DeepDiff
+        path.
+        """
+        cache_key = 'physical2' if use_t2 else 'physical1'
+        if cache_key in self._identity_paths:
+            cached = self._identity_paths[cache_key]
+            return None if cached is None else self._format_result(root, cached)
+        result = ''
+        representable = True
+        for child, rel in self._walk_identity_chain():
+            if use_t2 and child.up.t2_child_rel is not None:
+                next_rel = child.up.t2_child_rel
+            else:
+                next_rel = rel
+            if isinstance(next_rel, IdentityRelationship):
+                index = next_rel.physical_param2 if use_t2 else next_rel.physical_param
+                if index is None:
+                    representable = False
+                    break
+                result += f'[{index}]'
+            else:
+                item = next_rel.get_param_repr(None)
+                if item:
+                    result += item
+                else:
+                    representable = False
+                    break
+        if not representable:
+            self._identity_paths[cache_key] = None
+            return None
+        self._identity_paths[cache_key] = result
+        return self._format_result(root, result)
+
+    @property
+    def identity(self) -> Any:
+        """The identity tuple when this level is reached through an identity
+        list relationship, else ``None``."""
+        level = self
+        while level is not None and level.up is not None:
+            rel = level.up.t1_child_rel or level.up.t2_child_rel
+            if isinstance(rel, IdentityRelationship):
+                return rel.param
+            level = level.up
+        return None
+
     def create_deeper(self,
                       new_t1: Any,
                       new_t2: Any,
@@ -831,23 +1009,81 @@ class DiffLevel:
                 result.down = copy(orig.down)
 
                 if orig.t1_child_rel is not None:
-                    result.t1_child_rel = ChildRelationship.create(
-                        klass=orig.t1_child_rel.__class__,
-                        parent=result.t1,
-                        child=result.down.t1,
-                        param=orig.t1_child_rel.param)
+                    if isinstance(orig.t1_child_rel, IdentityRelationship):
+                        result.t1_child_rel = IdentityRelationship(
+                            result.t1, result.down.t1, orig.t1_child_rel.param,
+                            physical_param=orig.t1_child_rel.physical_param,
+                            physical_param2=orig.t1_child_rel.physical_param2)
+                    else:
+                        result.t1_child_rel = ChildRelationship.create(
+                            klass=orig.t1_child_rel.__class__,
+                            parent=result.t1,
+                            child=result.down.t1,
+                            param=orig.t1_child_rel.param)
                 if orig.t2_child_rel is not None:
-                    result.t2_child_rel = ChildRelationship.create(
-                        klass=orig.t2_child_rel.__class__,
-                        parent=result.t2,
-                        child=result.down.t2,
-                        param=orig.t2_child_rel.param)
+                    if isinstance(orig.t2_child_rel, IdentityRelationship):
+                        result.t2_child_rel = IdentityRelationship(
+                            result.t2, result.down.t2, orig.t2_child_rel.param,
+                            physical_param=orig.t2_child_rel.physical_param,
+                            physical_param2=orig.t2_child_rel.physical_param2)
+                    else:
+                        result.t2_child_rel = ChildRelationship.create(
+                            klass=orig.t2_child_rel.__class__,
+                            parent=result.t2,
+                            child=result.down.t2,
+                            param=orig.t2_child_rel.param)
 
             # descend to next level
             orig = orig.down
             if result.down is not None:
                 result = result.down
         return result
+
+    def branch_identity(self, t1_value: Any, t2_value: Any, identity: Any,
+                        physical1: Optional[int], physical2: Optional[int]) -> 'DiffLevel':
+        """
+        Lightweight branch used by identity list comparisons.
+
+        The ancestor chain is rebuilt with shallow copies (no relationship
+        object reconstruction), which keeps sibling branches independent at a
+        fraction of the cost of the generic :meth:`copy` machinery.
+        """
+        ancestors = []
+        current = self
+        while current is not None:
+            ancestors.append(current)
+            current = current.up
+        ancestors.reverse()
+
+        cloned_top = shallow_copy(ancestors[0])
+        cloned_top._path = dict_()
+        cloned_top._identity_paths = dict_()
+        cloned_top.additional = copy(ancestors[0].additional)
+        cloned_prev = cloned_top
+        for ancestor in ancestors[1:]:
+            clone = shallow_copy(ancestor)
+            clone._path = dict_()
+            clone._identity_paths = dict_()
+            clone.additional = copy(ancestor.additional)
+            clone.up = cloned_prev
+            cloned_prev.down = clone
+            cloned_prev = clone
+
+        new_level = DiffLevel(
+            t1_value, t2_value, down=None, up=cloned_prev,
+            verbose_level=self.verbose_level)
+        cloned_prev.down = new_level
+        rel1 = IdentityRelationship(
+            cloned_prev.t1, t1_value, identity,
+            physical_param=physical1, physical_param2=physical2
+        ) if t1_value is not notpresent else None
+        rel2 = IdentityRelationship(
+            cloned_prev.t2, t2_value, identity,
+            physical_param=physical1, physical_param2=physical2
+        ) if t2_value is not notpresent else None
+        cloned_prev.t1_child_rel = rel1
+        cloned_prev.t2_child_rel = rel2
+        return new_level
 
 
 class ChildRelationship:
@@ -956,6 +1192,34 @@ class ChildRelationship:
 class DictRelationship(ChildRelationship):
     param_repr_format: Optional[str] = "[{}]"
     quote_str: Optional[str] = "'{}'"
+
+
+class IdentityRelationship(ChildRelationship):
+    """
+    Relationship between an identity list and one of its records when
+    ``iterable_keys`` is in use. The ``param`` is the record's stable
+    identity (a tuple of ``(type_name, value)`` pairs) while
+    ``physical_param`` / ``physical_param2`` remember the physical indexes on
+    each side so that both the stable path and the two physical paths remain
+    available.
+    """
+
+    param_repr_format: Optional[str] = "[{}]"
+    quote_str: Optional[str] = None
+
+    def __init__(self, parent: Any, child: Any, param: Optional[Any] = None,
+                 physical_param: Optional[int] = None,
+                 physical_param2: Optional[int] = None) -> None:
+        super().__init__(parent, child, param)
+        self.physical_param = physical_param
+        self.physical_param2 = physical_param2
+
+    def stringify_param(self, force: Optional[str] = None) -> Optional[str]:
+        # Local import to avoid a module-level cycle (identity imports path
+        # helpers only lazily).
+        from deepdiff.identity import format_identity_segment
+        assert self.param is not None
+        return format_identity_segment(self.param)
 
 
 class NumpyArrayRelationship(ChildRelationship):
