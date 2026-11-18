@@ -182,6 +182,7 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
                  include_paths: Union[str, List[str], None]=None,
                  iterable_compare_func: Optional[Callable]=None,
                  iterable_keys: Optional[Dict[str, Union[str, Tuple[str, ...], List[str]]]]=None,
+                 reference_mode: Optional[str]=None,
                  log_frequency_in_sec: int=0,
                  log_scale_similarity_threshold: float=0.1,
                  log_stacktrace: bool=False,
@@ -266,6 +267,49 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
             self.number_to_string = number_to_string_func or number_to_string
             self.iterable_compare_func = iterable_compare_func
             self.iterable_keys = iterable_keys
+            self.reference_mode = reference_mode
+            if reference_mode is not None and reference_mode != "graph":
+                raise ValueError(
+                    f"reference_mode must be None or 'graph', got {reference_mode!r}.")
+            if reference_mode == "graph":
+                self._init_graph_mode(
+                    t1=t1, t2=t2, ignore_order=ignore_order, group_by=group_by,
+                    iterable_compare_func=iterable_compare_func,
+                    iterable_keys=iterable_keys, exclude_paths=exclude_paths,
+                    include_paths=include_paths, exclude_regex_paths=exclude_regex_paths,
+                    exclude_types=exclude_types, exclude_obj_callback=exclude_obj_callback,
+                    include_obj_callback=include_obj_callback,
+                    exclude_obj_callback_strict=exclude_obj_callback_strict,
+                    include_obj_callback_strict=include_obj_callback_strict,
+                    significant_digits=significant_digits,
+                    ignore_numeric_type_changes=ignore_numeric_type_changes,
+                    ignore_string_type_changes=ignore_string_type_changes,
+                    ignore_type_in_groups=ignore_type_in_groups,
+                    ignore_string_case=ignore_string_case,
+                    ignore_nan_inequality=ignore_nan_inequality,
+                    math_epsilon=math_epsilon, number_format_notation=number_format_notation,
+                    zip_ordered_iterables=zip_ordered_iterables,
+                    report_repetition=report_repetition,
+                    custom_operators=custom_operators, hasher=hasher,
+                    use_enum_value=use_enum_value, view=view,
+                    ignore_order_func=ignore_order_func,
+                    get_deep_distance=get_deep_distance,
+                    cutoff_distance_for_pairs=cutoff_distance_for_pairs,
+                    cutoff_intersection_for_pairs=cutoff_intersection_for_pairs,
+                    use_log_scale=use_log_scale,
+                    log_scale_similarity_threshold=log_scale_similarity_threshold,
+                    ignore_type_subclasses=ignore_type_subclasses,
+                    ignore_uuid_types=ignore_uuid_types,
+                    encodings=encodings,
+                    ignore_encoding_errors=ignore_encoding_errors,
+                    truncate_datetime=truncate_datetime,
+                    default_timezone=default_timezone,
+                    number_to_string_func=number_to_string_func,
+                    max_diffs=max_diffs, max_passes=max_passes,
+                    group_by_sort_key=group_by_sort_key,
+                    ignore_private_variables=ignore_private_variables,
+                )
+                return
             self.identity_registry = IdentityRegistry(iterable_keys)
             if self.identity_registry:
                 if ignore_order:
@@ -431,6 +475,144 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
         result['ignore_repetition'] = not self.report_repetition
         result['number_to_string_func'] = self.number_to_string
         return result
+
+    # ------------------------------------------------------------------
+    # Graph reference mode (reference_mode="graph")
+    # ------------------------------------------------------------------
+
+    # Parameters whose default value means "no semantic change requested"; any
+    # other supplied value is rejected explicitly instead of being ignored.
+    _GRAPH_SUPPORTED_DEFAULTS = {
+        'exclude_paths': None,
+        'include_paths': None,
+        'exclude_regex_paths': None,
+        'exclude_types': None,
+        'exclude_obj_callback': None,
+        'include_obj_callback': None,
+        'exclude_obj_callback_strict': None,
+        'include_obj_callback_strict': None,
+        'significant_digits': None,
+        'ignore_numeric_type_changes': False,
+        'ignore_string_type_changes': False,
+        'ignore_type_in_groups': [],
+        'ignore_string_case': False,
+        'ignore_nan_inequality': False,
+        'math_epsilon': None,
+        'number_format_notation': 'f',
+        'zip_ordered_iterables': False,
+        'report_repetition': False,
+        'custom_operators': None,
+        'hasher': None,
+        'use_enum_value': False,
+        'ignore_order_func': None,
+        'get_deep_distance': False,
+        'cutoff_distance_for_pairs': CUTOFF_DISTANCE_FOR_PAIRS_DEFAULT,
+        'cutoff_intersection_for_pairs': CUTOFF_INTERSECTION_FOR_PAIRS_DEFAULT,
+        'use_log_scale': False,
+        'log_scale_similarity_threshold': 0.1,
+        'ignore_type_subclasses': False,
+        'ignore_uuid_types': False,
+        'encodings': None,
+        'ignore_encoding_errors': False,
+        'truncate_datetime': None,
+        'default_timezone': datetime.timezone.utc,
+        'number_to_string_func': None,
+        'max_diffs': None,
+        'max_passes': 10000000,
+        'group_by_sort_key': None,
+        'ignore_private_variables': True,
+    }
+
+    def _init_graph_mode(self, **kwargs) -> None:
+        """Validate parameters and run the self contained graph engine."""
+        if kwargs['iterable_keys'] is not None:
+            raise ValueError("reference_mode='graph' can not be used together with iterable_keys.")
+        if kwargs['ignore_order']:
+            raise ValueError("reference_mode='graph' can not be used together with ignore_order=True.")
+        if kwargs['group_by'] is not None:
+            raise ValueError("reference_mode='graph' can not be used together with group_by.")
+        if kwargs['iterable_compare_func'] is not None:
+            raise ValueError(
+                "reference_mode='graph' can not be used together with iterable_compare_func.")
+        rejected = [
+            name for name, default in self._GRAPH_SUPPORTED_DEFAULTS.items()
+            if kwargs[name] != default
+        ]
+        if rejected:
+            raise ValueError(
+                "The following parameter(s) change comparison semantics and are not supported together "
+                "with reference_mode='graph': " + ", ".join(sorted(rejected)) + ".")
+        if kwargs['view'] not in (TEXT_VIEW, TREE_VIEW):
+            raise ValueError(
+                f"reference_mode='graph' only supports the 'text' and 'tree' views, got {kwargs['view']!r}.")
+
+        # The engine validates the supported type set itself (cycles included)
+        # and raises GraphError/UnsupportedGraphTypeError on anything else.
+        from deepdiff.graph_delta import diff_graphs as _diff_graphs
+        graph_result = _diff_graphs(kwargs['t1'], kwargs['t2'])
+
+        self.t1 = kwargs['t1']
+        self.t2 = kwargs['t2']
+        self.view = kwargs['view']
+        self.verbose_level = 1
+        self.ignore_order = False
+        self.report_repetition = False
+        self.group_by = None
+        self.iterable_compare_func = None
+        self._numpy_paths = {}
+        self._iterable_opcodes = {}
+        self.graph_patch = graph_result.patch
+        self.graph_result = graph_result
+        self._stats = {}
+
+        # Tree view: expose the GraphChange objects under their report keys.
+        tree = TreeResult()
+        for report_key, changes in graph_result.changes.items():
+            if changes:
+                ordered = SetOrdered()
+                for change in changes:
+                    ordered.add(change)
+                tree[report_key] = ordered
+        tree.remove_empty_keys()
+        self.tree = tree
+
+        if self.view == TREE_VIEW:
+            self.update(tree)
+        else:
+            self.update(self._graph_text_view(graph_result))
+
+    def _graph_text_view(self, graph_result) -> Dict[str, Any]:
+        """Render graph changes as plain JSON-safe dictionaries for text view."""
+        from deepdiff.graph_delta import GRAPH_VALUES_CHANGED
+        text: Dict[str, Any] = {}
+        for report_key, changes in graph_result.changes.items():
+            if not changes:
+                continue
+            entries = []
+            for change in changes:
+                entry = {
+                    'path_t1': change.path_t1,
+                    'path_t2': change.path_t2,
+                    'node_t1': change.node_id,
+                    'node_t2': change.other_node_id,
+                    'label_t1': change.label_t1,
+                    'label_t2': change.label_t2,
+                }
+                if change.has_t1:
+                    entry['old_value'] = change.t1
+                if change.has_t2:
+                    entry['new_value'] = change.t2
+                if change.report_type == GRAPH_VALUES_CHANGED and change.affected_aliases:
+                    entry['affected_aliases'] = [list(edge) for edge in change.affected_aliases]
+                if change.endpoint_t1 is not None:
+                    entry['endpoint_t1'] = change.endpoint_t1
+                if change.endpoint_t2 is not None:
+                    entry['endpoint_t2'] = change.endpoint_t2
+                if change.affected_aliases:
+                    entry['affected_aliases'] = [list(edge) for edge in change.affected_aliases]
+                entries.append(entry)
+            text[report_key] = entries
+        return text
 
     def _report_result(self, report_type, change_level, local_tree=None):
         """

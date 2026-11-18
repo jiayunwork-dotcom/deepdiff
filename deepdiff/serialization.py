@@ -228,6 +228,11 @@ class SerializationMixin:
         """
 
         view = view_override if view_override else self.view  # type: ignore
+        if getattr(self, 'reference_mode', None) == 'graph':
+            # The graph text view is built eagerly and stored directly on the
+            # DeepDiff instance; reuse it instead of re-rendering GraphChange
+            # objects through the generic tree machinery.
+            return dict(self)
         return dict(self._get_view_results(view))  # type: ignore
 
     def _to_delta_dict(
@@ -304,6 +309,10 @@ class SerializationMixin:
         if getattr(self, 'identity_registry', None) and self.identity_registry:  # type: ignore
             from deepdiff.identity_delta import build_identity_patch, IDENTITY_PATCH_KEY
             result[IDENTITY_PATCH_KEY] = build_identity_patch(self)
+
+        if getattr(self, 'reference_mode', None) == 'graph':
+            from deepdiff.graph_delta import GRAPH_PATCH_KEY
+            result[GRAPH_PATCH_KEY] = self.graph_patch
 
         return deepcopy(dict(result))
 
@@ -451,6 +460,15 @@ def _get_pretty_form_text(verbose_level):
         "iterable_identity_item_added": "Record {diff_path} (identity {identity}) added to iterable.",
         "iterable_identity_item_removed": "Record {diff_path} (identity {identity}) removed from iterable.",
         "iterable_identity_moved": "Record {diff_path} (identity {identity}) moved from {path_t1} to {path_t2}.",
+        "graph_values_changed": "Graph scalar {diff_path} changed from {val_t1} to {val_t2}.",
+        "graph_dictionary_item_added": "Graph dictionary edge {diff_path} added.",
+        "graph_dictionary_item_removed": "Graph dictionary edge {diff_path} removed.",
+        "graph_iterable_item_added": "Graph list edge {diff_path} added.",
+        "graph_iterable_item_removed": "Graph list edge {diff_path} removed.",
+        "graph_alias_added": "Graph alias edge {diff_path} now points at n{endpoint_t2}.",
+        "graph_alias_removed": "Graph alias edge {diff_path} no longer points at n{endpoint_t1}.",
+        "graph_node_added": "Graph node {diff_path} added.",
+        "graph_node_removed": "Graph node {diff_path} removed.",
     }
     if verbose_level == 2:
         pretty_form_texts.update(
@@ -467,6 +485,16 @@ def _get_pretty_form_text(verbose_level):
 
 
 def pretty_print_diff(diff):
+    if getattr(diff, 'report_type', '').startswith('graph_'):
+        from deepdiff.graph_delta import GRAPH_REPORT_KEYS  # avoid import cycles at module load
+        text = _get_pretty_form_text(diff.verbose_level).get(diff.report_type, "")
+        return text.format(
+            diff_path=diff.path(),
+            val_t1=diff.t1,
+            val_t2=diff.t2,
+            endpoint_t1=diff.endpoint_t1,
+            endpoint_t2=diff.endpoint_t2,
+        )
     type_t1 = get_type(diff.t1).__name__
     type_t2 = get_type(diff.t2).__name__
 

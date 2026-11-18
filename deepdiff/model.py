@@ -34,6 +34,16 @@ REPORT_KEYS: Set[str] = {
     "iterable_identity_item_added",
     "iterable_identity_item_removed",
     "iterable_identity_moved",
+    # reference_mode="graph" report keys
+    "graph_values_changed",
+    "graph_dictionary_item_added",
+    "graph_dictionary_item_removed",
+    "graph_iterable_item_added",
+    "graph_iterable_item_removed",
+    "graph_alias_added",
+    "graph_alias_removed",
+    "graph_node_added",
+    "graph_node_removed",
 }
 
 CUSTOM_FIELD: str = "__internal:custom:extra_info"

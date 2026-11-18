@@ -13,3 +13,9 @@ from .deephash import DeepHash as DeepHash
 from .delta import Delta as Delta
 from .delta import DeltaConflictError as DeltaConflictError
 from .path import extract as extract, parse_path as parse_path
+from .graph_model import (
+    GraphError as GraphError,
+    UnsupportedGraphTypeError as UnsupportedGraphTypeError,
+    GraphPatchError as GraphPatchError,
+    GraphConflictError as GraphConflictError,
+)

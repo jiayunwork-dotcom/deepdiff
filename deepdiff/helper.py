@@ -818,6 +818,17 @@ class FlatDataAction(EnumBase):
     identity_list_sequence = 'identity_list_sequence'
     identity_change = 'identity_change'
     identity_metadata = 'identity_metadata'
+    # reference_mode="graph" actions
+    graph_metadata = 'graph_metadata'
+    graph_topology = 'graph_topology'
+    graph_correspondence = 'graph_correspondence'
+    graph_scalar_change = 'graph_scalar_change'
+    graph_edge_added = 'graph_edge_added'
+    graph_edge_removed = 'graph_edge_removed'
+    graph_alias_event = 'graph_alias_event'
+    graph_node_event = 'graph_node_event'
+    graph_fingerprint = 'graph_fingerprint'
+    graph_list_alignment = 'graph_list_alignment'
 
 
 OPCODE_TAG_TO_FLAT_DATA_ACTION = {

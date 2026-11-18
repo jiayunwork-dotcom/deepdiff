@@ -1,5 +1,8 @@
 # DeepDiff Change log
 
+- Unreleased
+    - Added graph reference mode: `DeepDiff(t1, t2, reference_mode="graph")` compares object graphs with shared containers and cycles, distinguishes aliasing from copied equal subtrees, and produces bidirectional, versioned JSON- and flat-dict-serializable graph deltas that reconstruct the target topology without mutating the input. See `docs/graph_mode.rst`.
+
 - v8-6-1
     - Patched security vulnerability in the Delta class which was vulnerable to class pollution via its constructor, and when combined with a gadget available in DeltaDiff itself, it could lead to Denial of Service and Remote Code Execution (via insecure Pickle deserialization).
 

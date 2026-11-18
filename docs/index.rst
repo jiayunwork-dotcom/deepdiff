@@ -163,6 +163,7 @@ References
 
    diff
    iterable_keys
+   graph_mode
    dsearch
    deephash
    delta

@@ -24,6 +24,8 @@ from deepdiff.summarize import summarize
 from deepdiff.identity_delta import IDENTITY_PATCH_KEY, reverse_identity_patch, IDENTITY_PATCH_VERSION
 from deepdiff.identity_engine import IdentityDeltaEngine, DeltaConflictError
 from deepdiff.identity import IdentityError
+from deepdiff.graph_delta import GRAPH_PATCH_KEY
+from deepdiff.graph_engine import GraphDeltaEngine, validate_patch as validate_graph_patch, GraphPatchError
 # Re-exported as part of the public API (also re-exported from deepdiff/__init__.py).
 __all__ = ['Delta', 'DeltaError', 'DeltaNumpyOperatorOverrideError', 'DeltaConflictError']
 
@@ -166,6 +168,15 @@ class Delta:
         if self._identity_patch is not None and not self.bidirectional:
             raise ValueError(
                 "Deltas created with iterable_keys require bidirectional=True.")
+        self._graph_patch = self.diff.get(GRAPH_PATCH_KEY)
+        if self._graph_patch is not None:
+            try:
+                validate_graph_patch(self._graph_patch)
+            except GraphPatchError:
+                raise
+            if not self.bidirectional:
+                raise ValueError(
+                    "Deltas created with reference_mode='graph' require bidirectional=True.")
         # When an identity patch is present, bidirectional usage is mandatory
         # so reverse application and conflict verification stay well defined.
         # When we create the delta from a list of flat dictionaries, details such as iterable_compare_func_was_used get lost.
@@ -233,6 +244,10 @@ class Delta:
         Set ``reverse=True`` to apply the reverse direction (equivalent to
         subtracting the delta), swapping the before/after roles.
         """
+        if self._graph_patch is not None:
+            raise DeltaError(
+                "apply_rebased is not available for deltas created with reference_mode='graph'; "
+                "graph deltas only support strict bidirectional application.")
         if self._identity_patch is None:
             raise DeltaError(
                 "apply_rebased is only available for deltas created with iterable_keys.")
@@ -246,6 +261,9 @@ class Delta:
     def __add__(self, other):
         if isinstance(other, numbers) and self._numpy_paths:  # type: ignore
             raise DeltaNumpyOperatorOverrideError(DELTA_NUMPY_OPERATOR_OVERRIDE_MSG)
+        if self._graph_patch is not None:
+            engine = GraphDeltaEngine(self._graph_patch, reverse=False)
+            return engine.apply(other)
         if self._identity_patch is not None:
             engine = IdentityDeltaEngine(self._identity_patch, reverse=False, rebased=False)
             return engine.apply(other)
@@ -279,6 +297,9 @@ class Delta:
     __radd__ = __add__
 
     def __rsub__(self, other):
+        if self._graph_patch is not None:
+            engine = GraphDeltaEngine(self._graph_patch, reverse=True)
+            return engine.apply(other)
         if self._identity_patch is not None:
             reversed_patch = reverse_identity_patch(self._identity_patch)
             engine = IdentityDeltaEngine(reversed_patch, reverse=True, rebased=False)
@@ -987,6 +1008,136 @@ class Delta:
     def to_dict(self):
         return dict(self.diff)
 
+    # ------------------------------------------------------------------
+    # Graph reference mode flat-dict (de)serialization
+    # ------------------------------------------------------------------
+
+    def _flatten_graph_patch(self) -> List[FlatDeltaRow]:
+        """Flatten a graph patch into machine readable flat rows."""
+        from deepdiff.helper import FlatDataAction
+        patch = self._graph_patch
+        rows: List[FlatDeltaRow] = [FlatDeltaRow(
+            path=['__graph__'],
+            action=FlatDataAction.graph_metadata,
+            value={'version': patch['version'], 'mode': patch['mode']},
+        )]
+        for side in ('t1', 't2'):
+            rows.append(FlatDeltaRow(
+                path=['__graph__', side, 'topology'],
+                action=FlatDataAction.graph_topology,
+                value=patch[f'{side}_topology'],
+            ))
+        rows.append(FlatDeltaRow(
+            path=['__graph__', 'correspondence'],
+            action=FlatDataAction.graph_correspondence,
+            value=patch['correspondence'],
+        ))
+        for alignment in patch['list_alignments']:
+            rows.append(FlatDeltaRow(
+                path=['__graph__', 'list_alignments', alignment['t1_node'], alignment['t2_node']],
+                action=FlatDataAction.graph_list_alignment,
+                value=alignment['rows'],
+            ))
+        for entry in patch['scalar_changes']:
+            rows.append(FlatDeltaRow(
+                path=['__graph__', 'scalar_changes'],
+                action=FlatDataAction.graph_scalar_change,
+                value=entry,
+            ))
+        for action_name, section, flat_action in (
+            ('edge_added', patch['edge_added'], FlatDataAction.graph_edge_added),
+            ('edge_removed', patch['edge_removed'], FlatDataAction.graph_edge_removed),
+        ):
+            for entry in section:
+                rows.append(FlatDeltaRow(
+                    path=['__graph__', action_name], action=flat_action, value=entry))
+        for entry in patch['alias_events']:
+            rows.append(FlatDeltaRow(
+                path=['__graph__', 'alias_events'],
+                action=FlatDataAction.graph_alias_event, value=entry))
+        for entry in patch['node_events']:
+            rows.append(FlatDeltaRow(
+                path=['__graph__', 'node_events'],
+                action=FlatDataAction.graph_node_event, value=entry))
+        for side in ('t1', 't2'):
+            rows.append(FlatDeltaRow(
+                path=['__graph__', 'fingerprints', side],
+                action=FlatDataAction.graph_fingerprint,
+                value=patch['fingerprints'][side],
+                old_value=patch['fingerprints'][f'{side}_nodes'],
+            ))
+        return rows
+
+    @staticmethod
+    def _graph_patch_from_flat_rows(flat_dict_list):
+        """Reconstruct and validate a graph patch from flat rows."""
+        from deepdiff.graph_engine import validate_patch
+        metadata = None
+        topologies = {}
+        correspondence = None
+        list_alignments = []
+        scalar_changes, edge_added, edge_removed = [], [], []
+        alias_events, node_events = [], []
+        fingerprints = {}
+        graph_actions = {
+            'graph_metadata', 'graph_topology', 'graph_correspondence',
+            'graph_scalar_change', 'graph_edge_added', 'graph_edge_removed',
+            'graph_alias_event', 'graph_node_event', 'graph_fingerprint',
+            'graph_list_alignment',
+        }
+        for flat in flat_dict_list:
+            action = flat.get('action')
+            action_value = action.value if hasattr(action, 'value') else action
+            if action_value not in graph_actions:
+                continue
+            path = flat.get('path')
+            if not isinstance(path, list) or not path or path[0] != '__graph__':
+                raise DeltaError("Corrupt graph flat rows: missing the '__graph__' path marker.")
+            if action_value == 'graph_metadata':
+                metadata = flat.get('value')
+            elif action_value == 'graph_topology':
+                # path is ['__graph__', 't1'|'t2', 'topology'].
+                topologies[path[1] + '_topology'] = flat.get('value')
+            elif action_value == 'graph_correspondence':
+                correspondence = flat.get('value')
+            elif action_value == 'graph_list_alignment':
+                list_alignments.append({
+                    't1_node': path[2], 't2_node': path[3], 'rows': flat.get('value')})
+            elif action_value == 'graph_scalar_change':
+                scalar_changes.append(flat.get('value'))
+            elif action_value == 'graph_edge_added':
+                edge_added.append(flat.get('value'))
+            elif action_value == 'graph_edge_removed':
+                edge_removed.append(flat.get('value'))
+            elif action_value == 'graph_alias_event':
+                alias_events.append(flat.get('value'))
+            elif action_value == 'graph_node_event':
+                node_events.append(flat.get('value'))
+            elif action_value == 'graph_fingerprint':
+                side = path[2]
+                fingerprints[side] = flat.get('value')
+                fingerprints[side + '_nodes'] = flat.get('old_value')
+        if metadata is None:
+            raise DeltaError(
+                "Corrupt graph flat rows: missing the graph metadata row; refusing to fall back "
+                "to a tree based delta.")
+        patch = {
+            'version': metadata.get('version'),
+            'mode': metadata.get('mode'),
+            't1_topology': topologies.get('t1_topology'),
+            't2_topology': topologies.get('t2_topology'),
+            'correspondence': correspondence,
+            'list_alignments': list_alignments,
+            'scalar_changes': scalar_changes,
+            'edge_added': edge_added,
+            'edge_removed': edge_removed,
+            'alias_events': alias_events,
+            'node_events': node_events,
+            'fingerprints': fingerprints,
+        }
+        validate_patch(patch)
+        return patch
+
     def _flatten_identity_patch(self) -> List[FlatDeltaRow]:
         """
         Flatten the structured identity patch into machine readable rows.
@@ -1164,14 +1315,29 @@ class Delta:
             'identity_metadata', 'identity_list_added', 'identity_list_removed',
             'identity_list_sequence', 'identity_change',
         }
+        graph_actions = {
+            'graph_metadata', 'graph_topology', 'graph_correspondence',
+            'graph_scalar_change', 'graph_edge_added', 'graph_edge_removed',
+            'graph_alias_event', 'graph_node_event', 'graph_fingerprint',
+            'graph_list_alignment',
+        }
         has_identity_rows = any(
             (row.get('action').value if hasattr(row.get('action'), 'value') else row.get('action'))
             in identity_actions
             for row in flat_dict_list
         )
+        has_graph_rows = any(
+            (row.get('action').value if hasattr(row.get('action'), 'value') else row.get('action'))
+            in graph_actions
+            for row in flat_dict_list
+        )
         if has_identity_rows:
             patch = Delta._identity_patch_from_flat_rows(flat_dict_list)
             result[IDENTITY_PATCH_KEY] = patch
+            return result
+        if has_graph_rows:
+            patch = Delta._graph_patch_from_flat_rows(flat_dict_list)
+            result[GRAPH_PATCH_KEY] = patch
             return result
         FLATTENING_NEW_ACTION_MAP = {
             'unordered_iterable_item_added': 'iterable_items_added_at_indexes',
@@ -1345,6 +1511,8 @@ class Delta:
             _parse_path = parse_path
         if self._identity_patch is not None:
             result.extend(self._flatten_identity_patch())
+        if self._graph_patch is not None:
+            result.extend(self._flatten_graph_patch())
         if report_type_changes:
             keys_and_funcs = [
                 ('value', 'value', None),
