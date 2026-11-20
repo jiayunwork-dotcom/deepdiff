@@ -154,15 +154,19 @@ class IdentityRegistry:
         leading to a container, return the key spec if that container is a
         declared identity list, otherwise ``None``.
 
-        A declaration matches when its elements are a prefix of the supplied
-        chain, so nested containers can resolve the declaration of an
-        enclosing identity list before their own suffix has been walked.
+        A declaration matches a concrete list only when its parsed elements
+        are an *exact* match for the chain (a wildcard element consumes
+        exactly one list element layer, as documented). This deliberately does
+        not use prefix matching: a key rule declared for a parent record list
+        must never be inherited by a nested plain list such as
+        ``root['records'][*]['values']`` unless that path is declared on its
+        own. Nested identity lists resolve their own declaration once their
+        full chain has been walked.
         """
         if not self._parsed:
             return None
-        best: Optional[Tuple[int, KeySpec]] = None
         for parsed, key_spec, original_path in self._parsed:
-            if len(parsed) > len(elements):
+            if len(parsed) != len(elements):
                 continue
             for (decl_elem, is_wildcard), (elem, action) in zip(parsed, elements):
                 if action != GET:
@@ -170,10 +174,11 @@ class IdentityRegistry:
                 if not is_wildcard and decl_elem != elem:
                     break
             else:
-                # Prefer the longest (most specific) matching declaration.
-                if best is None or len(parsed) > best[0]:
-                    best = (len(parsed), key_spec)
-        return None if best is None else best[1]
+                # All declarations are normalized paths; an exact chain can
+                # only match a single declaration because two different
+                # declaration paths cannot produce the same parsed chain.
+                return key_spec
+        return None
 
     def items(self):
         return self.declarations.items()
@@ -419,9 +424,12 @@ def stable_path_elements(path: str) -> List[Tuple[str, Any]]:
 
     * ``('field', 'name')`` for dictionary fields
     * ``('identity', Identity)`` for identity list segments
+    * ``('index', int)`` for physical positions inside an ordinary
+      (non declared) ordered list, so mixed paths such as
+      ``root['records'][int=1]['values'][0]`` stay addressable
 
     Raises ``IdentityError`` on malformed input. Never uses ``eval``.
-    Results are cached because the same stable path is parsed repeatedly
+    Results are cached because the same path is parsed repeatedly
     during a delta application.
     """
     cached = _STABLE_PATH_CACHE.get(path)
@@ -448,6 +456,13 @@ def stable_path_elements(path: str) -> List[Tuple[str, Any]]:
         if '=' in inner:
             elements.append(('identity', parse_identity_segment(segment)))
         else:
+            # Plain bracket segment: either a dictionary field or a physical
+            # list index. A small strict parser decides which one instead of
+            # evaluating arbitrary text.
+            if inner.lstrip('+-').isdigit():
+                elements.append(('index', int(inner)))
+                i = end + 1
+                continue
             # Plain dictionary field. Reuse the safe standard parser for one
             # bracket segment instead of inventing another literal parser.
             from ast import literal_eval
@@ -457,8 +472,8 @@ def stable_path_elements(path: str) -> List[Tuple[str, Any]]:
                 raise IdentityError(f"Malformed stable path {path!r}: {exc}") from None
             if not isinstance(value, str):
                 raise IdentityError(
-                    f"Non identity list segments in stable paths must be string dictionary fields; "
-                    f"got {value!r} in {path!r}.")
+                    f"Non identity list segments in stable paths must be string dictionary fields or "
+                    f"integer list indexes; got {value!r} in {path!r}.")
             elements.append(('field', value))
         i = end + 1
     _STABLE_PATH_CACHE[path] = tuple(elements)
@@ -475,9 +490,22 @@ def format_stable_path(elements: Sequence[Tuple[str, Any]]) -> str:
             out.append('[' + stringify_element(value, quote_str="'{}'") + ']')
         elif kind == 'identity':
             out.append(format_identity_segment(value))
+        elif kind == 'index':
+            out.append(f'[{value}]')
         else:  # pragma: no cover - defensive
             raise IdentityError(f"Unknown stable path element kind {kind!r}.")
     return ''.join(out)
+
+
+def path_has_identity(elements: Sequence[Tuple[str, Any]]) -> bool:
+    """True when a parsed (mixed) stable path contains an identity segment."""
+    return any(kind == 'identity' for kind, _ in elements)
+
+
+# Flat-dict token tagging an ordinary list index, mirroring
+# ``IDENTITY_PATH_MARKER`` for identity segments so the field/index
+# distinction survives a flat round trip.
+INDEX_PATH_MARKER = '__index__'
 
 
 def physical_elements_from_stable(elements: Sequence[Tuple[str, Any]]) -> Tuple[Any, ...]:
@@ -490,14 +518,17 @@ def stable_path_to_flat_tokens(path: str) -> List[Any]:
     Convert a stable path string into JSON-safe flat-dict tokens.
 
     Dictionary fields become plain strings; identity segments become tagged
-    dictionaries of the form ``{"__identity__": [[type, value], ...]}`` so the
-    distinction between a field and an identity survives a flat round trip
+    dictionaries of the form ``{"__identity__": [[type, value], ...]}`` and
+    ordinary list indexes become ``{"__index__": n}`` so the distinction
+    between a field, an index and an identity survives a flat round trip
     without any use of ``eval``.
     """
     tokens: List[Any] = []
     for kind, value in stable_path_elements(path):
         if kind == 'field':
             tokens.append(value)
+        elif kind == 'index':
+            tokens.append({INDEX_PATH_MARKER: value})
         else:
             tokens.append({IDENTITY_PATH_MARKER: identity_to_json(value)})
     return tokens
@@ -509,6 +540,11 @@ def flat_tokens_to_stable_path(tokens: Sequence[Any]) -> str:
     for token in tokens:
         if isinstance(token, Mapping) and IDENTITY_PATH_MARKER in token:
             elements.append(('identity', identity_from_json(token[IDENTITY_PATH_MARKER])))
+        elif isinstance(token, Mapping) and INDEX_PATH_MARKER in token:
+            index = token[INDEX_PATH_MARKER]
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise IdentityError("Corrupt path metadata: list indexes must be integers.")
+            elements.append(('index', index))
         else:
             elements.append(('field', token))
     return format_stable_path(elements)

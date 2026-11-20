@@ -69,6 +69,41 @@ also exposes the physical path on each side (``path_t1`` / ``path_t2``) so
 both the stable identity and the two physical locations remain visible.
 Lists without a declaration keep the existing ordered comparison.
 
+Mixed identity and ordinary paths
+---------------------------------
+
+A declaration applies only to the list whose path it actually matches. The
+``[*]`` wildcard consumes exactly one list element layer, and a parent
+record list's key rule is **not** inherited by nested lists:
+
+.. code-block:: python
+
+    before = {"records": [{"id": 1, "values": [1, 2]}], "batch": 1}
+    after  = {"records": [{"id": 1, "values": [0, 1, 2]}], "batch": 2}
+    DeepDiff(before, after, iterable_keys={"root['records']": "id"})
+
+Here ``records`` is compared by identity while ``values`` stays an ordinary
+ordered list and ``batch`` is an ordinary scalar field. A single diff, delta
+and rebase then carry *all* of the changes together:
+
+* ordinary fields and lists with no identity ancestor (such as ``batch``);
+* identity located records and their fields;
+* ordinary ordered sub-lists nested inside an identity record, addressed by
+  mixed paths such as ``root['records'][int=1]['values'][0]``;
+* identity sub-lists reached through an ordinary list, declared explicitly
+  with a wildcard, for example
+  ``root['groups'][*]['items']``.
+
+Ordinary lists keep the existing in-order comparison, so a positional change
+is never mislabeled as an identity move. When an undeclared list gains, loses
+or reorders elements, the delta stores that list once as a whole replaced
+subtree (its recorded old list and its new list) instead of replaying index
+edits. On application the subtree is verified as one unit: a current list
+equal to the old one is updated, one already equal to the new one is accepted
+and any third content raises :class:`deepdiff.DeltaConflictError`, so writes
+never continue against drifted indexes. Lists whose structure did not change
+keep their normal index addressed leaf edits.
+
 In the tree view each affected :class:`~deepdiff.model.DiffLevel` exposes:
 
 * ``level.stable_path()`` – identity based path;
@@ -126,3 +161,29 @@ unknown identity metadata is rejected explicitly rather than silently
 degrading to an index based patch, and paths are never evaluated with
 ``eval``. Deltas and diffs created without ``iterable_keys`` keep their
 original behavior unchanged.
+
+Patch format compatibility
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The structured patch under ``_identity_patch`` carries an integer ``version``:
+
+* version 2 (current) stores every plain field change in ``changes`` and
+  every structurally changed ordinary list in a ``plain_lists`` section of
+  ``{'path', 'old_value', 'new_value', 'identity_aware'}`` entries, alongside
+  the existing ``declarations``, identity ``lists`` and identity sequences.
+  Flat dictionaries use an additional ``identity_plain_list`` row action and
+  ``{"__index__": n}`` path tokens for ordinary list positions;
+* version 1 deltas written by older releases remain readable. Their identity
+  entries are applied by the identity engine while any classic index based
+  entries stored beside them are still replayed by the regular delta engine.
+  Loading a version 1 document never upgrades or rewrites it;
+* an unknown version, a missing required section or a malformed entry is
+  rejected with a ``DeltaError`` at construction time, so no change carried by
+  the other path kind is silently dropped.
+
+Both versions only store touched subtrees. A structurally changed ordinary
+list contributes its actual old/new list content, while unchanged business
+payload on unrelated records is never copied into the patch. The identity
+index of each physical list is built once per application and reused for
+every change touching that list, so editing several fields of one record does
+not rescan the whole list.

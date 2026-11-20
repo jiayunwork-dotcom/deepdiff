@@ -818,6 +818,7 @@ class FlatDataAction(EnumBase):
     identity_list_sequence = 'identity_list_sequence'
     identity_change = 'identity_change'
     identity_metadata = 'identity_metadata'
+    identity_plain_list = 'identity_plain_list'
 
 
 OPCODE_TAG_TO_FLAT_DATA_ACTION = {

@@ -388,14 +388,18 @@ class DeltaResult(TextResult):
                 'iterable_identity_moved',
             ):
                 self.pop(identity_key, None)
-            # Stable-path entries produced for identity records would not be
-            # replayable by the index based delta engine; the identity engine
-            # owns them. Drop any entry whose path uses identity segments.
+            # Stable-path entries that address a record by identity would not
+            # be replayable by the index based delta engine; the identity
+            # engine owns them through the structured identity patch. Plain
+            # paths (including ordinary root fields and regular ordered lists
+            # that have no identity segment) stay here as classic entries.
             from deepdiff.identity import IDENTITY_PATH_SEGMENT_RE
             for report_key in (
                 'values_changed', 'type_changes',
                 'dictionary_item_added', 'dictionary_item_removed',
                 'attribute_added', 'attribute_removed',
+                'iterable_item_added', 'iterable_item_removed',
+                'iterable_item_moved',
             ):
                 bucket = self.get(report_key)
                 if isinstance(bucket, dict):

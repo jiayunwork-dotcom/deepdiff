@@ -24,9 +24,11 @@ from deepdiff.identity import (
 from deepdiff.identity_engine import (
     VALUE_CHANGED, TYPE_CHANGED, DICT_ADDED, DICT_REMOVED,
     ATTR_ADDED, ATTR_REMOVED, SET_ITEM_ADDED, SET_ITEM_REMOVED,
+    PLAIN_LISTS_KEY,
 )
 
-IDENTITY_PATCH_VERSION = 1
+IDENTITY_PATCH_VERSION = 2
+IDENTITY_PATCH_VERSION_LEGACY = 1
 IDENTITY_PATCH_KEY = '_identity_patch'
 
 # Tree report key -> internal change action.
@@ -102,14 +104,34 @@ def build_identity_patch(diff) -> Dict[str, Any]:
                 'after_identity': after_seq,
             }
 
+    # ---- ordinary ordered lists with structural changes -----------------
+    # Any undeclared list that gained, lost or reordered elements is stored
+    # once as a whole replaced subtree (old snapshot + new snapshot) instead
+    # of index based opcodes. Leaf value changes that happen *inside* an
+    # unaffected list keep their normal, index addressed entries.
+    plain_lists, structurally_changed_plain_paths = collect_plain_list_replacements(diff)
+
     # ---- leaf field changes ---------------------------------------------
+    # Every leaf change the tree view carries is captured here, including
+    # changes on ordinary fields/lists that have no identity ancestor (for
+    # example ``root['batch']``) and changes inside an ordinary ordered
+    # sub-list of a record (for example
+    # ``root['records'][int=1]['values'][0]``). A mixed diff therefore keeps
+    # one complete change set instead of dropping the plain half on the floor.
+    from deepdiff.identity import IDENTITY_PATH_SEGMENT_RE
     for report_type, action in _TREE_ACTION_MAP.items():
         for level in tree.get(report_type, []):
-            if level.identity is None:
-                # Non identity changes are handled by the regular delta path.
-                continue
             stable = level.stable_path()
+            if stable is None:
+                # Unrepresentable levels are still exposed through the regular
+                # delta dictionaries for the classic engine.
+                continue
+            if _is_inside_structurally_changed_plain_list(stable, structurally_changed_plain_paths):
+                # The enclosing plain list is already carried as a replaced
+                # subtree; its per-index edits must not be replayed twice.
+                continue
             entry: Dict[str, Any] = {'action': action, 'path': stable}
+            entry['identity_aware'] = bool(IDENTITY_PATH_SEGMENT_RE.search(stable))
             if action in (VALUE_CHANGED, TYPE_CHANGED):
                 entry['old_value'] = level.t1
                 entry['new_value'] = level.t2
@@ -122,12 +144,130 @@ def build_identity_patch(diff) -> Dict[str, Any]:
                 entry['old_value'] = level.t1
             changes.append(entry)
 
-    return {
+    patch = {
         'version': IDENTITY_PATCH_VERSION,
         'declarations': registry_to_json(registry),
         'lists': lists,
         'changes': changes,
     }
+    if plain_lists:
+        patch[PLAIN_LISTS_KEY] = plain_lists
+    return patch
+
+
+def collect_plain_list_replacements(diff):
+    """
+    Find every ordinary (non declared) list whose structure changed
+    (insertion, deletion or reorder) and return:
+
+    * a list of ``{'path', 'old_value', 'new_value', 'identity_aware'}``
+      entries carrying the full before/after subtree of each such list;
+    * the set of stable path prefixes whose descendants are fully covered
+      by a subtree replacement and therefore must not emit leaf edits.
+    """
+    from copy import deepcopy
+    from deepdiff.identity import (
+        stable_path_elements, format_stable_path, path_has_identity,
+    )
+    registry = diff.identity_registry
+    tree = diff.tree
+    # Map the stable path of each structurally changed ordinary list
+    # container to its concrete t1/t2 values, straight from the tree levels,
+    # so no identity based re-navigation is required.
+    containers: Dict[str, Tuple[Any, Any]] = {}
+
+    def _is_declared_list(level):
+        chain = diff._element_chain(level)
+        return registry.keys_for(chain) is not None
+
+    # Tree level structural reports for ordinary lists.
+    for report_type in ('iterable_item_added', 'iterable_item_removed', 'iterable_item_moved'):
+        for level in tree.get(report_type, []):
+            container = level.up
+            if isinstance(container.t1, list) and not _is_declared_list(container):
+                stable = container.stable_path()
+                if stable is not None:
+                    containers.setdefault(stable, (container.t1, container.t2))
+    # difflib opcode paths (basic hashable element lists) are regular paths;
+    # only keep those whose container is not a declared identity list.
+    for opcode_path in getattr(diff, '_iterable_opcodes', {}).keys():
+        elements = _regular_path_to_stable_elements(opcode_path)
+        if elements is None:
+            continue
+        lookup = tuple(
+            ('*', 'GET') if kind == 'identity' else (value, 'GET')
+            for kind, value in elements
+        )
+        if registry.keys_for(lookup) is not None:
+            continue
+        stable = format_stable_path(elements)
+        if stable in containers:
+            continue
+        old_value, old_found = _extract_regular(diff.t1, elements)
+        new_value, new_found = _extract_regular(diff.t2, elements)
+        if old_found or new_found:
+            containers[stable] = (old_value, new_value)
+
+    entries = []
+    covered_prefixes = set()
+    for stable in sorted(containers):
+        old_value, new_value = containers[stable]
+        entries.append({
+            'path': stable,
+            'old_value': deepcopy(old_value),
+            'new_value': deepcopy(new_value),
+            'identity_aware': path_has_identity(stable_path_elements(stable)),
+        })
+        covered_prefixes.add(stable)
+    return entries, covered_prefixes
+
+
+def _regular_path_to_stable_elements(path: str):
+    """Parse a regular DeepDiff path into field/index descriptor tuples."""
+    from deepdiff.path import _path_to_elements, GET
+    try:
+        raw = _path_to_elements(path, root_element=None)
+    except Exception:
+        return None
+    elements = []
+    for value, action in raw:
+        if action != GET:
+            return None
+        if isinstance(value, int) and not isinstance(value, bool):
+            elements.append(('index', value))
+        elif isinstance(value, str):
+            elements.append(('field', value))
+        else:
+            return None
+    return elements
+
+
+def _extract_regular(root, elements):
+    """
+    Navigate a field/index-only descriptor chain over a concrete snapshot.
+
+    Returns ``(value, found)`` so that a genuine ``None`` stored at the path
+    stays distinguishable from a missing path.
+    """
+    current = root
+    for kind, value in elements:
+        if kind == 'field':
+            if not isinstance(current, dict) or value not in current:
+                return None, False
+            current = current[value]
+        else:
+            if not isinstance(current, list) or value >= len(current):
+                return None, False
+            current = current[value]
+    from copy import deepcopy
+    return deepcopy(current), True
+
+
+def _is_inside_structurally_changed_plain_list(stable_path: str, covered_prefixes) -> bool:
+    for prefix in covered_prefixes:
+        if stable_path == prefix or stable_path.startswith(prefix + '['):
+            return True
+    return False
 
 
 def collect_identity_sequences(diff, list_paths):
@@ -155,7 +295,7 @@ def collect_identity_sequences(diff, list_paths):
             # its identity sequence.
             if isinstance(obj, list):
                 lookup = tuple(
-                    ('*', 'GET') if kind == 'identity' else (value, 'GET')
+                    ('*', 'GET') if kind in ('identity', 'index') else (value, 'GET')
                     for kind, value in elements
                 )
                 spec = registry.keys_for(lookup)
@@ -173,7 +313,7 @@ def collect_identity_sequences(diff, list_paths):
                 # To descend into records we need the spec that applies to
                 # this list.
                 lookup = tuple(
-                    ('*', 'GET') if kind == 'identity' else (value, 'GET')
+                    ('*', 'GET') if kind in ('identity', 'index') else (value, 'GET')
                     for kind, value in elements
                 )
                 spec = registry.keys_for(lookup)
@@ -183,7 +323,11 @@ def collect_identity_sequences(diff, list_paths):
                                                side, index)
                         recurse(record, elements + [('identity', identity)])
                     elif isinstance(record, (dict, list)):
-                        recurse(record, elements)
+                        # An ordinary (non declared) list: keep its physical
+                        # layer in the element chain so declarations reached
+                        # through a ``[*]`` wildcard (for example
+                        # ``root['groups'][*]['items']``) still resolve.
+                        recurse(record, elements + [('index', index)])
 
         recurse(snapshot, [])
         return sequences
@@ -222,6 +366,16 @@ def reverse_identity_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
             'before_identity': descriptor.get('after_identity'),
             'after_identity': descriptor.get('before_identity'),
         }
+    # Ordinary ordered list subtrees simply swap their old/new snapshots.
+    reversed_plain_lists = [
+        {
+            'path': entry['path'],
+            'old_value': entry['new_value'],
+            'new_value': entry['old_value'],
+            'identity_aware': entry.get('identity_aware', True),
+        }
+        for entry in patch.get(PLAIN_LISTS_KEY, [])
+    ]
     reversed_changes = []
     for change in patch.get('changes', []):
         action = change['action']
@@ -236,6 +390,9 @@ def reverse_identity_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
             SET_ITEM_REMOVED: SET_ITEM_ADDED,
         }[action]
         entry = {'action': reversed_action, 'path': change['path']}
+        from deepdiff.identity import path_has_identity as _path_has_identity, stable_path_elements as _spe
+        entry['identity_aware'] = change.get('identity_aware',
+                                             _path_has_identity(_spe(change['path'])))
         if action in (VALUE_CHANGED, TYPE_CHANGED):
             entry['old_value'] = change['new_value']
             entry['new_value'] = change['old_value']
@@ -247,9 +404,12 @@ def reverse_identity_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
         else:
             entry['old_value'] = change['new_value']
         reversed_changes.append(entry)
-    return {
+    reversed_patch = {
         'version': patch['version'],
         'declarations': patch['declarations'],
         'lists': reversed_lists,
         'changes': reversed_changes,
     }
+    if PLAIN_LISTS_KEY in patch:
+        reversed_patch[PLAIN_LISTS_KEY] = reversed_plain_lists
+    return reversed_patch

@@ -1,5 +1,9 @@
 # DeepDiff Change log
 
+- Unreleased
+    - Fixed mixed `iterable_keys` and ordinary path handling: plain fields and ordered lists no longer inherit a parent record list's identity rule, and changes on those paths are now carried through diff, Delta bidirectional apply/subtract, `apply_rebased`, JSON serialization and flat-dict round trips instead of being dropped.
+    - Structurally changed ordinary (non declared) lists are stored in the identity patch as whole verified subtree replacements (new `plain_lists` section, patch `version` 2); version 1 patches remain readable.
+
 - v8-6-1
     - Patched security vulnerability in the Delta class which was vulnerable to class pollution via its constructor, and when combined with a gadget available in DeltaDiff itself, it could lead to Denial of Service and Remote Code Execution (via insecure Pickle deserialization).
 

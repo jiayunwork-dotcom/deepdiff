@@ -21,7 +21,7 @@ from deepdiff.path import (
 )
 from deepdiff.anyset import AnySet
 from deepdiff.summarize import summarize
-from deepdiff.identity_delta import IDENTITY_PATCH_KEY, reverse_identity_patch, IDENTITY_PATCH_VERSION
+from deepdiff.identity_delta import IDENTITY_PATCH_KEY, reverse_identity_patch
 from deepdiff.identity_engine import IdentityDeltaEngine, DeltaConflictError
 from deepdiff.identity import IdentityError
 # Re-exported as part of the public API (also re-exported from deepdiff/__init__.py).
@@ -191,20 +191,32 @@ class Delta:
         """
         Reject corrupt or unrecognized identity metadata explicitly instead
         of silently degrading to an index based patch.
+
+        Version 1 patches (written by older releases) are still accepted: they
+        only carried identity located changes and are applied through the
+        identity engine, while any classic index based entries stored beside
+        them are replayed by the regular engine. Version 2 patches additionally
+        carry plain field changes and whole ordinary-list subtree replacements
+        inside the structured patch.
         """
+        from deepdiff.identity_delta import IDENTITY_PATCH_VERSION, IDENTITY_PATCH_VERSION_LEGACY
         patch = self._identity_patch
         if not isinstance(patch, dict):
             raise DeltaError("Corrupt identity patch: expected a dictionary.")
         version = patch.get('version')
-        if version != IDENTITY_PATCH_VERSION:
+        if version not in (IDENTITY_PATCH_VERSION_LEGACY, IDENTITY_PATCH_VERSION):
             raise DeltaError(
-                f"Unrecognized identity patch version {version!r}; expected "
-                f"{IDENTITY_PATCH_VERSION}. Refusing to apply it as an index based delta.")
+                f"Unrecognized identity patch version {version!r}; expected one of "
+                f"{IDENTITY_PATCH_VERSION_LEGACY} or {IDENTITY_PATCH_VERSION}. "
+                f"Refusing to apply it as an index based delta.")
         for required in ('declarations', 'lists', 'changes'):
             if required not in patch:
                 raise DeltaError(f"Corrupt identity patch: missing {required!r}.")
         if not isinstance(patch['lists'], dict) or not isinstance(patch['changes'], list):
             raise DeltaError("Corrupt identity patch: malformed lists or changes.")
+        plain_lists = patch.get('plain_lists', [])
+        if plain_lists is not None and not isinstance(plain_lists, list):
+            raise DeltaError("Corrupt identity patch: malformed plain_lists section.")
         try:
             from deepdiff.identity import registry_from_json, identity_from_json
             registry_from_json(patch['declarations'])
@@ -217,6 +229,10 @@ class Delta:
                     if sequence is not None:
                         for payload in sequence:
                             identity_from_json(payload)
+            for entry in plain_lists or []:
+                if not isinstance(entry, dict) or 'path' not in entry \
+                        or 'old_value' not in entry or 'new_value' not in entry:
+                    raise IdentityError("Corrupt plain list replacement entry.")
         except IdentityError as exc:
             raise DeltaError(f"Corrupt identity patch metadata: {exc}") from None
 
@@ -240,15 +256,126 @@ class Delta:
             raise DeltaError("apply_rebased requires a bidirectional delta.")
         patch = reverse_identity_patch(self._identity_patch) if reverse else self._identity_patch
         engine = IdentityDeltaEngine(patch, reverse=reverse, rebased=True)
-        return engine.apply(current)
+        result = engine.apply(current)
+        if self._has_classic_identity_sidecar():
+            sidecar_diff = {
+                key: copy.deepcopy(value)
+                for key, value in self.diff.items()
+                if not key.startswith('_') and key != IDENTITY_PATCH_KEY
+            }
+            if reverse:
+                sidecar_diff = self._reverse_sidecar_diff(sidecar_diff)
+            sidecar = Delta(
+                delta_diff=sidecar_diff,
+                bidirectional=self.bidirectional,
+                mutate=True,
+                raise_errors=True,
+                deserializer=self.deserializer,
+            )
+            result = sidecar + result
+        return result
 
+
+    def _has_classic_identity_sidecar(self) -> bool:
+        """
+        True when this delta stores classic index based entries that the
+        structured identity patch does not already cover and which therefore
+        have to be replayed by the regular engine as well.
+
+        Version 2 patches capture every plain field change and every ordinary
+        list subtree replacement inside the structured patch itself, so their
+        classic dictionaries only duplicate information for inspection and
+        must not be applied a second time. Version 1 patches predate that
+        storage: any non empty classic dictionary they carry is real work the
+        identity engine cannot do.
+        """
+        if self._identity_patch is None:
+            return False
+        if self._identity_patch.get('version', 1) >= 2:
+            return False
+        for key, value in self.diff.items():
+            if key.startswith('_') or key == IDENTITY_PATCH_KEY:
+                continue
+            if value:
+                return True
+        return False
+
+    def _apply_identity_then_classic(self, other, reverse: bool):
+        """
+        Apply the structured identity patch (which in version 2 also contains
+        every plain field change and ordinary list subtree replacement) and
+        then replay any remaining classic index based entries on the result.
+
+        The identity engine performs its full preflight before copying the
+        input, and the classic replay runs on the copied object only, so a
+        conflict never mutates the caller's tree.
+        """
+        if reverse:
+            patch = reverse_identity_patch(self._identity_patch)
+            engine = IdentityDeltaEngine(patch, reverse=True, rebased=False)
+        else:
+            engine = IdentityDeltaEngine(self._identity_patch, reverse=False, rebased=False)
+        result = engine.apply(other)
+        if self._has_classic_identity_sidecar():
+            # Reuse the battle tested index based machinery on a temporary
+            # Delta view whose structured patch is hidden, so the same entries
+            # are not applied twice. Version 1 sidecars need their classic
+            # dictionaries reversed explicitly when subtracting.
+            sidecar_diff = {
+                key: copy.deepcopy(value)
+                for key, value in self.diff.items()
+                if not key.startswith('_') and key != IDENTITY_PATCH_KEY
+            }
+            if reverse:
+                sidecar_diff = self._reverse_sidecar_diff(sidecar_diff)
+            sidecar = Delta(
+                delta_diff=sidecar_diff,
+                bidirectional=self.bidirectional,
+                mutate=True,
+                raise_errors=True,
+                deserializer=self.deserializer,
+            )
+            result = sidecar + result
+        return result
+
+    @staticmethod
+    def _reverse_sidecar_diff(sidecar_diff: dict) -> dict:
+        """Reverse the classic dictionaries of a version 1 identity sidecar."""
+        reversed_diff = {}
+        simple_swap = {
+            'iterable_item_added': 'iterable_item_removed',
+            'iterable_item_removed': 'iterable_item_added',
+            'attribute_added': 'attribute_removed',
+            'attribute_removed': 'attribute_added',
+            'dictionary_item_added': 'dictionary_item_removed',
+            'dictionary_item_removed': 'dictionary_item_added',
+            'set_item_added': 'set_item_removed',
+            'set_item_removed': 'set_item_added',
+        }
+        for key, value in sidecar_diff.items():
+            swapped = simple_swap.get(key)
+            if swapped is not None:
+                reversed_diff[swapped] = copy.deepcopy(value)
+            elif key in ('values_changed', 'type_changes'):
+                bucket = {}
+                for path, info in value.items():
+                    entry = dict(info)
+                    if 'old_value' in entry and 'new_value' in entry:
+                        entry['old_value'], entry['new_value'] = \
+                            entry['new_value'], entry['old_value']
+                    bucket[path] = entry
+                reversed_diff[key] = bucket
+            else:
+                # Unknown sidecar content: keep as-is rather than silently
+                # dropping it; the classic engine reports if it cannot apply.
+                reversed_diff[key] = copy.deepcopy(value)
+        return reversed_diff
 
     def __add__(self, other):
         if isinstance(other, numbers) and self._numpy_paths:  # type: ignore
             raise DeltaNumpyOperatorOverrideError(DELTA_NUMPY_OPERATOR_OVERRIDE_MSG)
         if self._identity_patch is not None:
-            engine = IdentityDeltaEngine(self._identity_patch, reverse=False, rebased=False)
-            return engine.apply(other)
+            return self._apply_identity_then_classic(other, reverse=False)
         if self.mutate:
             self.root = other
         else:
@@ -280,9 +407,7 @@ class Delta:
 
     def __rsub__(self, other):
         if self._identity_patch is not None:
-            reversed_patch = reverse_identity_patch(self._identity_patch)
-            engine = IdentityDeltaEngine(reversed_patch, reverse=True, rebased=False)
-            return engine.apply(other)
+            return self._apply_identity_then_classic(other, reverse=True)
         if self._reversed_diff is None:
             self._reversed_diff = self._get_reverse_diff()
         self.diff, self._reversed_diff = self._reversed_diff, self.diff
@@ -1027,6 +1152,15 @@ class Delta:
                 value=descriptor.get('after_identity'),
                 old_value=descriptor.get('before_identity'),
             ))
+        # Ordinary ordered list subtree replacements (version 2 patches).
+        for entry in patch.get('plain_lists', []):
+            rows.append(FlatDeltaRow(
+                path=stable_path_to_flat_tokens(entry['path']),
+                action=FlatDataAction.identity_plain_list,
+                value=entry['new_value'],
+                old_value=entry['old_value'],
+                identity=entry.get('identity_aware', True),
+            ))
         for change in patch.get('changes', []):
             rows.append(FlatDeltaRow(
                 path=stable_path_to_flat_tokens(change['path']),
@@ -1040,10 +1174,11 @@ class Delta:
     @staticmethod
     def _identity_patch_from_flat_rows(flat_dict_list):
         """Reconstruct an identity patch from flat rows, validating it."""
-        from deepdiff.identity_delta import IDENTITY_PATCH_VERSION
+        from deepdiff.identity_delta import IDENTITY_PATCH_VERSION, IDENTITY_PATCH_VERSION_LEGACY
         metadata = None
         lists: Dict[str, Any] = {}
         changes = []
+        plain_lists = []
         from deepdiff.identity import flat_tokens_to_stable_path
         for flat in flat_dict_list:
             action = flat.get('action')
@@ -1078,6 +1213,13 @@ class Delta:
                     'before_identity': None, 'after_identity': None})
                 descriptor['after_identity'] = flat.get('value')
                 descriptor['before_identity'] = flat.get('old_value')
+            elif action_value == 'identity_plain_list':
+                plain_lists.append({
+                    'path': path_str,
+                    'old_value': flat.get('old_value'),
+                    'new_value': flat.get('value'),
+                    'identity_aware': bool(flat.get('identity', True)),
+                })
             elif action_value == 'identity_change':
                 change_action = flat.get('identity') or 'values_changed'
                 entry = {'action': change_action, 'path': path_str}
@@ -1090,16 +1232,19 @@ class Delta:
             raise DeltaError(
                 "Corrupt identity flat rows: missing the identity metadata row; "
                 "refusing to silently degrade to an index based delta.")
-        if metadata.get('version') != IDENTITY_PATCH_VERSION:
+        if metadata.get('version') not in (IDENTITY_PATCH_VERSION_LEGACY, IDENTITY_PATCH_VERSION):
             raise DeltaError(
-                f"Unrecognized identity patch version {metadata.get('version')!r}; expected "
-                f"{IDENTITY_PATCH_VERSION}.")
-        return {
+                f"Unrecognized identity patch version {metadata.get('version')!r}; expected one of "
+                f"{IDENTITY_PATCH_VERSION_LEGACY} or {IDENTITY_PATCH_VERSION}.")
+        patch = {
             'version': metadata['version'],
             'declarations': metadata['declarations'],
             'lists': lists,
             'changes': changes,
         }
+        if plain_lists:
+            patch['plain_lists'] = plain_lists
+        return patch
 
     def _flatten_iterable_opcodes(self, _parse_path):
         """
@@ -1162,7 +1307,7 @@ class Delta:
         # mixed into the regular index based dictionaries.
         identity_actions = {
             'identity_metadata', 'identity_list_added', 'identity_list_removed',
-            'identity_list_sequence', 'identity_change',
+            'identity_list_sequence', 'identity_change', 'identity_plain_list',
         }
         has_identity_rows = any(
             (row.get('action').value if hasattr(row.get('action'), 'value') else row.get('action'))
@@ -1172,7 +1317,27 @@ class Delta:
         if has_identity_rows:
             patch = Delta._identity_patch_from_flat_rows(flat_dict_list)
             result[IDENTITY_PATCH_KEY] = patch
+            # Version 2 flat documents store every plain change inside the
+            # structured patch, so no classic rows accompany them. Version 1
+            # documents may still carry classic index based rows beside the
+            # identity rows; reconstruct those as well so the sidecar survives
+            # a flat round trip instead of being silently dropped.
+            if patch.get('version', 1) < 2:
+                classic_rows = [
+                    row for row in flat_dict_list
+                    if (row.get('action').value
+                        if hasattr(row.get('action'), 'value')
+                        else row.get('action')) not in identity_actions
+                ]
+                if classic_rows:
+                    result.update(Delta._build_classic_diff_from_flat_dicts(classic_rows))
             return result
+        return Delta._build_classic_diff_from_flat_dicts(flat_dict_list)
+
+    @staticmethod
+    def _build_classic_diff_from_flat_dicts(flat_dict_list):
+        """Reconstruct the classic index based delta dictionaries from flat rows."""
+        result = {}
         FLATTENING_NEW_ACTION_MAP = {
             'unordered_iterable_item_added': 'iterable_items_added_at_indexes',
             'unordered_iterable_item_removed': 'iterable_items_removed_at_indexes',
@@ -1345,6 +1510,14 @@ class Delta:
             _parse_path = parse_path
         if self._identity_patch is not None:
             result.extend(self._flatten_identity_patch())
+            # Version 2 identity patches already capture every plain field
+            # change and ordinary list subtree inside the structured rows.
+            # Emitting the classic dictionaries as well would duplicate work
+            # and produce rows the identity reconstructor cannot parse, so
+            # the flat representation carries the structured rows only.
+            # Version 1 patches still expose their classic sidecar rows.
+            if self._identity_patch.get('version', 1) >= 2:
+                return result
         if report_type_changes:
             keys_and_funcs = [
                 ('value', 'value', None),

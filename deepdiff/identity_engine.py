@@ -35,6 +35,12 @@ ATTR_ADDED = 'attribute_added'
 ATTR_REMOVED = 'attribute_removed'
 SET_ITEM_ADDED = 'set_item_added'
 SET_ITEM_REMOVED = 'set_item_removed'
+# An ordinary (non declared) ordered list changed structurally: the whole
+# list is replaced as one verified subtree instead of replaying index edits.
+PLAIN_LIST_REPLACED = 'plain_list_replaced'
+
+# Top level key of the per-list plain-subtree section of a version 2 patch.
+PLAIN_LISTS_KEY = 'plain_lists'
 
 CONFLICT_MISSING = 'missing'
 CONFLICT_PRESENT = 'already_present'
@@ -230,6 +236,23 @@ class IdentityDeltaEngine:
                     current = getattr(current, seg_value)
                 else:
                     current = ABSENT
+            elif seg_kind == 'index':
+                # Physical position inside an ordinary ordered list. The
+                # segment is only reached for mixed paths; the whole-list
+                # subtree check in preflight guarantees the index still means
+                # the same element at application time.
+                list_path = _path_prefix(elements, position)
+                if not isinstance(current, list):
+                    raise DeltaConflictError(
+                        list_path, CONFLICT_TYPE,
+                        expected=list, current=type(current))
+                parent = current
+                kind = 'list'
+                key = seg_value
+                if seg_value < len(current):
+                    current = current[seg_value]
+                else:
+                    current = ABSENT
             else:  # identity segment
                 list_path = _path_prefix(elements, position)
                 if not isinstance(current, list):
@@ -262,9 +285,33 @@ class IdentityDeltaEngine:
         # verified before descendant edits.
         for list_path, descriptor in self.lists.items():
             self._preflight_list(root, list_path, descriptor)
+        # Ordinary ordered lists that changed structurally are verified as a
+        # whole subtree before any leaf edit is considered.
+        for entry in self.patch.get(PLAIN_LISTS_KEY, []):
+            self._preflight_plain_list(root, entry)
         # Field level changes (values_changed / type_changes / dict add/remove).
         for change in self.patch.get('changes', []):
             self._preflight_change(root, change)
+
+    def _preflight_plain_list(self, root: Any, entry: Dict[str, Any]) -> None:
+        elements = stable_path_elements(entry['path'])
+        parent, kind, key, current = self._navigate(root, elements, for_write=False)
+        old_value = entry['old_value']
+        new_value = entry['new_value']
+        if current is ABSENT:
+            raise DeltaConflictError(entry['path'], CONFLICT_MISSING,
+                                     expected=old_value, current=ABSENT)
+        if not isinstance(current, list):
+            raise DeltaConflictError(entry['path'], CONFLICT_TYPE,
+                                     expected=list, current=type(current))
+        if self.rebase and values_equal(current, new_value):
+            return  # already applied -> accept
+        if not values_equal(current, old_value):
+            raise DeltaConflictError(
+                entry['path'], CONFLICT_VALUE,
+                expected=old_value, current=current,
+                message=(f"Ordinary list at {entry['path']} diverged from the recorded subtree; "
+                         f"refusing to replay index based edits onto a drifted list."))
 
     def _path_goes_through_missing_identity(self, root: Any, elements: List[Tuple[str, Any]]) -> bool:
         """True if an identity segment on this path cannot resolve in ``root``."""
@@ -279,6 +326,10 @@ class IdentityDeltaEngine:
                 if seg_value not in index_map.identity_to_index:
                     return True
                 current = current[index_map.identity_to_index[seg_value]]
+            elif seg_kind == 'index':
+                if not isinstance(current, list) or seg_value >= len(current):
+                    return False
+                current = current[seg_value]
             else:
                 if isinstance(current, dict):
                     if seg_value not in current:
@@ -303,15 +354,14 @@ class IdentityDeltaEngine:
         identity_map = self._identity_map(container, list_path, side)
 
         # Removed records: the whole subtree must still equal the recorded
-        # old subtree (strict) or be gone already (rebase idempotency).
+        # old subtree (strict or rebase), or be gone already so a same
+        # direction replay stays idempotent.
         for record in descriptor.get('removed', []):
             identity = identity_from_json(record['identity'])
             index = identity_map.identity_to_index.get(identity)
             old_value = record['old_value']
             if index is None:
-                if self.rebase:
-                    continue  # already removed -> accept
-                raise DeltaConflictError(list_path, CONFLICT_NOT_FOUND, identity, ABSENT)
+                continue  # already removed -> idempotent replay
             current_value = container[index]
             if not values_equal(current_value, old_value):
                 raise DeltaConflictError(
@@ -327,8 +377,8 @@ class IdentityDeltaEngine:
             if index is None:
                 continue  # will be appended/inserted at execution time
             current_value = container[index]
-            if self.rebase and values_equal(current_value, new_value):
-                continue  # idempotent / already applied
+            if values_equal(current_value, new_value):
+                continue  # already applied -> idempotent replay
             raise DeltaConflictError(
                 self._record_path(list_path, identity), CONFLICT_PRESENT,
                 expected=ABSENT, current=current_value)
@@ -350,23 +400,24 @@ class IdentityDeltaEngine:
                     raise DeltaConflictError(path, CONFLICT_NOT_FOUND,
                                              expected=expected_old, current=ABSENT)
                 raise DeltaConflictError(path, CONFLICT_MISSING, expected=expected_old, current=ABSENT)
-            if self.rebase and values_equal(current, new_value):
-                return  # already applied
+            # Same direction application must be idempotent in both engines:
+            # a leaf already holding the patch target is accepted, while a
+            # third value still conflicts with the recorded old value.
+            if values_equal(current, new_value):
+                return
             if not values_equal(current, expected_old):
                 raise DeltaConflictError(path, CONFLICT_VALUE, expected=expected_old, current=current)
         elif action in (DICT_ADDED, ATTR_ADDED, SET_ITEM_ADDED):
             new_value = change['new_value']
             if current is ABSENT:
                 return
-            if self.rebase and values_equal(current, new_value):
+            if values_equal(current, new_value):
                 return
             raise DeltaConflictError(path, CONFLICT_PRESENT, expected=ABSENT, current=current)
         elif action in (DICT_REMOVED, ATTR_REMOVED, SET_ITEM_REMOVED):
             expected_old = change['old_value']
             if current is ABSENT:
-                if self.rebase:
-                    return
-                raise DeltaConflictError(path, CONFLICT_MISSING, expected=expected_old, current=ABSENT)
+                return
             if not values_equal(current, expected_old):
                 raise DeltaConflictError(path, CONFLICT_VALUE, expected=expected_old, current=current)
 
@@ -383,9 +434,27 @@ class IdentityDeltaEngine:
             outcome = self._execute_list(replaced_root, list_path, descriptor)
             if outcome is not None:
                 replaced_root = outcome
+        # Replace structurally changed ordinary ordered lists as whole
+        # subtrees (preflight already proved the current subtree matches the
+        # recorded old one, or the rebase target).
+        for entry in self.patch.get(PLAIN_LISTS_KEY, []):
+            outcome = self._execute_plain_list(replaced_root, entry)
+            if outcome is not None:
+                replaced_root = outcome
         for change in self.patch.get('changes', []):
             self._execute_change(replaced_root, change)
         return replaced_root
+
+    def _execute_plain_list(self, root: Any, entry: Dict[str, Any]) -> Optional[Any]:
+        elements = stable_path_elements(entry['path'])
+        if not elements:
+            # The ordinary list is the root object itself.
+            return deepcopy(entry['new_value'])
+        parent, kind, key, current = self._navigate(root, elements, for_write=True)
+        if self.rebase and current is not ABSENT and values_equal(current, entry['new_value']):
+            return None
+        self._replace_container(parent, kind, key, deepcopy(entry['new_value']))
+        return None
 
     def _execute_list(self, root: Any, list_path: str, descriptor: Dict[str, Any]) -> Optional[Any]:
         """Apply one identity list change; return a new root when the list is
@@ -460,16 +529,16 @@ class IdentityDeltaEngine:
         parent, kind, key, current = self._navigate(root, elements, for_write=True)
         if action in (VALUE_CHANGED, TYPE_CHANGED):
             new_value = change['new_value']
-            if self.rebase and current is not ABSENT and values_equal(current, new_value):
+            if current is not ABSENT and values_equal(current, new_value):
                 return
             self._set_value(parent, kind, key, new_value)
         elif action in (DICT_ADDED, ATTR_ADDED, SET_ITEM_ADDED):
             new_value = change['new_value']
-            if current is not ABSENT and self.rebase and values_equal(current, new_value):
+            if current is not ABSENT and values_equal(current, new_value):
                 return
             self._set_value(parent, kind, key, new_value)
         elif action in (DICT_REMOVED, ATTR_REMOVED, SET_ITEM_REMOVED):
-            if current is ABSENT and self.rebase:
+            if current is ABSENT:
                 return
             self._del_value(parent, kind, key)
 
